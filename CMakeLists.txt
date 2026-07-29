@@ -36,17 +36,6 @@ target_compile_options(minirt PRIVATE
 )
 
 # -----------------------------
-# 示例程序
-# -----------------------------
-add_executable(basic_submit
-    examples/basic_submit.cpp
-)
-
-target_link_libraries(basic_submit PRIVATE
-    minirt
-)
-
-# -----------------------------
 # 单元测试
 # -----------------------------
 include(CTest)
