@@ -1,0 +1,27 @@
+# Build directories
+build/
+build-*/
+out/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Compiler outputs
+*.o
+*.a
+*.so
+*.dylib
+*.exe
