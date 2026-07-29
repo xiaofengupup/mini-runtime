@@ -97,7 +97,19 @@ void ThreadPool::WorkerLoop()
     while (true) {
         Task task;
         {
+            /**
+             * 这里使用 unique_lock 是因为 condition_variable::wait() 在等待过程中需要：
+             * 1. 自动释放 m_mutex
+             * 2. 进入休眠
+             * 3. 被唤醒后重新获取 mutex
+             * 4. 返回调用代码
+             * 
+             * std::lock_guard 不支持中途主动结果和重新加锁，因此条件变量通常搭配 st::unique_lock。
+             */
             std::unique_lock<std::mutex> lock(m_mutex);
+            /*
+             * 条件变量可能发生虚假唤醒，所以线程唤醒不代表一定存在任务，因此每次醒来都必须重新检查条件
+             */
             m_cv.wait(lock, [this] {
                 return m_stopping || !m_tasks.empty();
             });
