@@ -2,12 +2,21 @@ cmake_minimum_required(VERSION 3.16)
 
 project(MiniRuntime VERSION 0.1.0 LANGUAGES CXX)
 
+# -----------------------------
+# 设置 C++ 标准
+# -----------------------------
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# -----------------------------
+# 系统线程库
+# -----------------------------
 find_package(Threads REQUIRED) # 会在 Linux 下正确添加 -pthread
 
+# -----------------------------
+# MiniRuntime 静态库
+# -----------------------------
 add_library(minirt STATIC
     src/thread_pool.cpp
 )
@@ -28,6 +37,9 @@ target_compile_options(minirt PRIVATE
         >
 )
 
+# -----------------------------
+# 示例程序
+# -----------------------------
 add_executable(basic_submit
     examples/basic_submit.cpp
 )
@@ -36,9 +48,24 @@ target_link_libraries(basic_submit PRIVATE
     minirt
 )
 
+# -----------------------------
+# 单元测试
+# -----------------------------
 include(CTest)
 
 if(BUILD_TESTING)
+    # GoogleTest 官方提供 CMake FetchContent 集成方式
+    include(FetchContent)
+    FetchContent_Declare(googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.17.0
+        GIT_SHALLOW TRUE
+    )
+
+    # 避免 Windows 下 GoogleTest 和主项目使用不同 CRT。
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
     add_executable(test_thread_pool
         tests/test_thread_pool.cpp
     )
@@ -46,10 +73,19 @@ if(BUILD_TESTING)
     target_link_libraries(test_thread_pool
         PRIVATE
             minirt
+            GTest::gtest_main
     )
 
-    add_test(
-        NAME thread_pool_tests
-        COMMAND test_thread_pool
+    target_compile_options(test_thread_pool
+        PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:
+                -Wall
+                -Wextra
+                -Wpedantic
+            >
     )
+
+    # CMake 官方则推荐使用 gtest_discover_tests()，它会从测试程序中自动发现每个 TEST，并分别注册到 CTest
+    include(GoogleTest)
+    gtest_discover_tests(test_thread_pool)
 endif()
