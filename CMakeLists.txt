@@ -29,12 +29,10 @@ target_link_libraries(minirt PUBLIC
     Threads::Threads
 )
 
-target_compile_options(minirt PRIVATE
-    $<CXX_COMPILER_ID:GNU,Clang,AppleClang>:
-            -Wall
-            -Wextra
-            -Wpedantic
-        >
+target_compile_options(minirt PRIVATE 
+    -Wall
+    -Wextra
+    -Wpedantic
 )
 
 # -----------------------------
@@ -70,19 +68,15 @@ if(BUILD_TESTING)
         tests/test_thread_pool.cpp
     )
 
-    target_link_libraries(test_thread_pool
-        PRIVATE
-            minirt
-            GTest::gtest_main
+    target_link_libraries(test_thread_pool PRIVATE
+        minirt
+        GTest::gtest_main
     )
 
-    target_compile_options(test_thread_pool
-        PRIVATE
-            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:
-                -Wall
-                -Wextra
-                -Wpedantic
-            >
+    target_compile_options(test_thread_pool PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
     )
 
     # CMake 官方则推荐使用 gtest_discover_tests()，它会从测试程序中自动发现每个 TEST，并分别注册到 CTest

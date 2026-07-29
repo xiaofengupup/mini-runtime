@@ -1,4 +1,5 @@
 #include "minirt/thread_pool.h"
+#include <gtest/gtest.h>
 
 #include <atomic>
 #include <stdexcept>
@@ -18,7 +19,7 @@ TEST(ThreadPoolTest, ExecutesAllSubmittedTasks)
     std::atomic<int> counter {0};
 
     for (int i = 0; i < taskCount; ++i) {
-        pool.Submit([&count] {
+        pool.Submit([&counter] {
             counter.fetch_add(1, std::memory_order_relaxed);
         });
     }
@@ -105,7 +106,7 @@ TEST(ThreadPoolTest, RejectsEmptyTask)
     minirt::ThreadPool pool(2);
     minirt::ThreadPool::Task emptyTask;
 
-    EXPECT_THROW(pool.Submit(std::move(empty_task)), std::invalid_argument);
+    EXPECT_THROW(pool.Submit(std::move(emptyTask)), std::invalid_argument);
     pool.Stop();
 }
 
