@@ -65,7 +65,6 @@ m_stopping && tasks_.empty()
 
 
 ## Day 1 验收清单
-今天结束前应确保：
 
 - [x] cmake 配置成功
 - [x] minirt 库编译成功
