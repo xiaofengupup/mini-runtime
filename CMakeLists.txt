@@ -53,16 +53,17 @@ if(BUILD_TESTING)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
 
-    add_executable(test_thread_pool
+    add_executable(minirt_tests
         tests/test_thread_pool.cpp
+        tests/test_submit.cpp
     )
 
-    target_link_libraries(test_thread_pool PRIVATE
+    target_link_libraries(minirt_tests PRIVATE
         minirt
         GTest::gtest_main
     )
 
-    target_compile_options(test_thread_pool PRIVATE
+    target_compile_options(minirt_tests PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -70,5 +71,5 @@ if(BUILD_TESTING)
 
     # CMake 官方则推荐使用 gtest_discover_tests()，它会从测试程序中自动发现每个 TEST，并分别注册到 CTest
     include(GoogleTest)
-    gtest_discover_tests(test_thread_pool)
+    gtest_discover_tests(minirt_tests)
 endif()
