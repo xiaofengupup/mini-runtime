@@ -9,8 +9,21 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <tuple>
+#include <future>
+#include <memory>
 
 namespace minirt {
+
+/**
+ * ThreadPool 生命周期状态
+ */
+enum class RuntimeState {
+    Created,
+    Running,
+    Stopping,
+    Stopped
+};
 
 class ThreadPool {
 public:
@@ -35,35 +48,181 @@ public:
     ThreadPool& operator=(ThreadPool&&) = delete;
 
     /**
-     * 提交一个无参数、无返回值的任务·
+     * 提交任意可调用对象；如果线程池已经停止，则抛出异常
      * 
-     * 如果线程池已经停止，则抛出异常
+     * 支持：
+     * - 普通函数
+     * - lambda
+     * - 函数对象
+     * - 成员函数指针
+     * - 普通参数
+     * - move-only 参数
+     * - 返回值
+     * - 异常传播
+     * 
+     * 代码含义：
+     *   1. template<typename T, typename... Args>：变参模板（Variadic Template）
+     *      F: 是要执行的函数或可调用对象，如 Lambda、函数指针、std::function 等。
+     *      Args: 是传递给 F 的可变参数类型包（零个或多个参数）
+     *   2. F&& function, Args&&... args：使用万能引用（Universal Reference），结合 std::forward 可以实现完美转发
+     *   3. using FunctionType = std::decay_t<F>; 定义函数对象的真正存储类型；
+     *   4. using ArgumentsTuple = std::tuple<std::decay_t<Args>...>; 定义一个元组（std::tuple）类型，用于将所有
+     *      的实参打成一个包，以便存入任务队列或异步闭包中。
+     * 
+     * decay-copy：退化拷贝，理解这一概念是掌握异步任务的关键。
+     *   问题场景：生命周期与安全引用。
+     *   当调用 Submit 函数时，传入的参数可能是左值引用（例如 int&）、优质引用或者是带 const/volatile 修饰符的类型。
+     *   如果直接使用原类型 F 和 Args... 去存储：
+     *     - 如果用户传进来一个局部变量的引用（例如 int x = 10; Submit(func, x);），此时 Args 会被推导为 int&；
+     *     - 异步任务的特点：Submit 函数会立即返回，而任务 Task 会在未来的某个时刻在另一个线程执行。
+     *     - 如果任务内部保存的是 int&，当 Submit 调用结束时，原线程栈上的 x 可能已经被销毁（生命周期结束）。此时，异步线程
+     *       再去访问这个引用，就会导致悬挂引用（Dangling Reference） 和 未定义行为（Undefined Behavior / 内存崩溃）。
+     * 
+     * 为什么需要使用 std::decay_t？
+     *   std::decay_t<T> 的作用是模拟 C++ 按值传递时的类型转换规则（类似于数组退化为指针、函数退化为函数指针）。
+     *     1. 移除引用：把 T& 和 T&& 变为 T。
+     *     2. 移除 const 和 volatile 修饰符（针对顶层类型）。
+     *     3. 数组/函数退化：将数组类型转换为指针，将函数类型转换为函数指针。
+     *   使用 std::decay_t 可以确保存储在任务闭包/元组中的是具备独立生命周期的值对象，而不是依赖外部栈空间的引用对象。
+     * 
+     * 为什么需要 std::tuple？
+     *   在 C ++ 中，Args.. 是一个参数包。参数包不能作为类的成员变量直接存储。要将多个类型、数量不定的参数作为一个整体
+     *   存入任务对象（如 std::packaged_task 或自定义 Task 类）中，必须使用 std::tuple。
+     *     - 打包：std::tuple<std::decay_t<Args>...> 可以将任意数量、任意类型的退化后参数“打成一个包裹”。
+     *     - 解包执行：在异步线程执行任务时，可以配合 std::apply 轻松将 std::tuple 解包并传递给函数执行。
+     * 
+     * 万能引用：
+     *  当 T&& 处于模板类型推导的环境下时，它不是普通的右值引用，而是万能引用：
+     *    - 如果传进来的是左值，它被推导为左值引用；
+     *    - 如果传进来的是右值，它被推导为右值引用或普通值；
+     *  这保证了 Submit 接口可以接受任何类型、任何值类别（左值/右值）的函数和参数，然后，
+     *  结合 std::make_tuple 和 std::forward 将参数完美转发并存入元组。
+     * 
      */
-    void Submit(Task task);
+    template<typename F, typename... Args>
+    auto Submit(F&& function, Args&&... args)
+    {
+        /*
+         * 异步任务不能依赖调用者栈上的转发引用
+         * 因此需要将函数和参数 decay-copy 或 move 到任务对象内部
+         */
+        using FunctionType = std::decay_t<F>;
+        using ArgumentsTuple = std::tuple<std::decay_t<Args>...>;
+
+        /*
+         * 推导异步函数 F 执行后的返回类型
+         * 
+         * std::invoke_result_t
+         * 原型：std::invoke_result_t<Callable, ArgTypes...>
+         * 是 C++ 17 引入的一个类型萃取（Type Trait）工具，用来替代 C++ 11 中被废弃的 std::result_of_t。
+         * 其作用是：在不实际执行函数的情况下，问编译器：如果我把这组参数传递给这个可调用对象，它会返回什么类型。
+         * 其中，写上 && 是为了精确推导当函数对象和参数以右值形式被调用时的返回值。
+         */
+        using ReturnType = std::invoke_result_t<FunctionType&&, std::decay_t<Args>&&...>;
+
+        /*
+         * std::packaged_task 是 C++ 11 引入的一个非常强大的异步任务打包工具。
+         * std::packaged_task<Signature> 是一个模板类，它的模板参数 Signature 是一个函数签名（例如 int(int, double) 或者 void()）。
+         * 它主要做两件事情：
+         *   1. 打包装可调用对象：它可以把任何可调用对象（普通函数、lambda、std::bind、仿函数）打包起来。
+         *   2. 连接 std::future：它内部关联了一个异步状态。当在某个线程中调用这个 packaged_task 时，
+         *      它的执行结果（返回值或者抛出的异常）会自动写入这个异步状态中；而持有对应 std::future 的线程就可以获取这个结果。
+         *
+         * packaged_task 负责：
+         * 1. 执行用户函数；
+         * 2. 保存返回值；
+         * 3. 捕获用户函数抛出的异常；
+         * 4. 将结果或异常写入 future 的共享状态；
+         * 
+         * 这里创建一个无参形式的 packaged_task，签名是 ReturnType()
+         * 由于 packaged_task 不支持拷贝（只能 move），为了能方便地放进 std::function 任务队列，
+         * 通常用 std::make_shared 将其包裹在智能指针中。
+         */
+        auto packagedTask = std::make_shared<std::packaged_task<ReturnType()>>(
+            [
+                callable = FunctionType(std::forward<F>(function)),
+                arguments = ArgumentsTuple(std::forward<Args>(args)...)
+            ]() mutable -> ReturnType {
+                return std::apply(std::move(callable), std::move(arguments));
+            }
+        );
+        
+        // 拿到 future 准备返回给调用者
+        std::future<ReturnType> future = packagedTask->get_future();
+
+        /**
+         * 将任务包装成 void() 类型的可调用对象，放入任务队列
+         * 
+         * 这里主要是因为 std::packaged_task 是 move-only 类型。
+         * Day 1 的任务队列保存 std::function<void()>，而 C++17 的 std::function 要求内部对象可复制。
+         * shared_ptr 本身可以复制，因此捕获 shared_ptr 的 lambda 可以保存到 std::function 中。
+         */
+        Enqueue([packagedTask]{
+            (*packagedTask)();
+        });
+        return future;
+    }
 
     /**
-     * 停止接收新任务
+     * 优雅关闭
      * 
-     * 已经进入任务队列的任务会继续执行；
-     * 该函数会等待所有工作线程退出，可以重复调用；
+     * - 停止接受新任务
+     * - 已排队任务继续执行
+     * - 等待所有工作线程退出
+     * - 可以重复调用
      */
-    void Stop();
+    void Shutdown();
+
+    /**
+     * 尽快关闭
+     * 
+     * - 停止接收新任务；
+     * - 丢弃尚未开始执行的任务；
+     * - 已经开始运行的任务继续执行；
+     * - 等待所有工作线程退出
+     * - 可以重复调用；
+     */
+    void ShutdownNow();
+
+    /**
+     * 获取当前线程池状态
+     */
+    RuntimeState GetState() const;
 
 private:
+    enum class ShutdownMode {
+        Drain,
+        DiscardPending,
+    };
+
+    /**
+     * 将已经参数类型的任务放入任务队列
+     */
+    void Enqueue(Task task);
+
+    /**
+     * Shutdown 和 ShutdownNow 的公共实现。
+     */
+    void ShutdownImpl(ShutdownMode mode);
+
     /**
      * 工作线程执行函数
      */
     void WorkerLoop();
 
 private:
+    RuntimeState m_state { RuntimeState::Created };
+
     std::vector<std::thread> m_workers;
     std::queue<Task> m_tasks;
 
-    std::mutex m_mutex;
+    /* 保护 m_tasks 和 m_state */
+    mutable std::mutex m_mutex;
     std::condition_variable m_cv;
 
-    bool m_stopping {false};
-
+    /* 串行化多个并发的 Shutdown 调用 */
+    std::mutex m_shutdownMutex;
+    
     /**
      * std::once_flag 是 C++ 11 引入的一个轻量级同步原语，位于 <mutex> 文件中。
      * 
@@ -77,7 +236,7 @@ private:
      * 
      * 此处用来保证 Stop() 中的停止和 join 逻辑只执行一次!
      */
-    std::once_flag m_stopOnce;
+    // std::once_flag m_stopOnce;
 };
 
 } // namespace minirt
