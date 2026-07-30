@@ -3,6 +3,11 @@
  */
 #pragma once
 
+#include "minirt/cancellation.h"
+#include "minirt/runtime_metrics.h"
+#include "minirt/task_handle.h"
+#include "minirt/thread_pool_options.h"
+
 #include <vector>
 #include <thread>
 #include <functional>
@@ -37,6 +42,11 @@ public:
     explicit ThreadPool(std::size_t threadCount);
 
     /**
+     * 使用完整配置构造线程池
+     */
+    explicit ThreadPool(ThreadPoolOptions options);
+
+    /**
      * 析构时停止线程池，并等待所有工作线程退出
      */
     ~ThreadPool();
@@ -48,6 +58,8 @@ public:
     ThreadPool& operator=(ThreadPool&&) = delete;
 
     /**
+     * 提交普通异步任务
+     * 
      * 提交任意可调用对象；如果线程池已经停止，则抛出异常
      * 
      * 支持：
@@ -137,8 +149,14 @@ public:
          * 这里创建一个无参形式的 packaged_task，签名是 ReturnType()
          * 由于 packaged_task 不支持拷贝（只能 move），为了能方便地放进 std::function 任务队列，
          * 通常用 std::make_shared 将其包裹在智能指针中。
+         * 
+         * 将任务包装成 void() 类型的可调用对象，放入任务队列
+         * 
+         * 主要是因为 std::packaged_task 是 move-only 类型。
+         * Day 1 的任务队列保存 std::function<void()>，而 C++17 的 std::function 要求内部对象可复制。
+         * shared_ptr 本身可以复制，因此捕获 shared_ptr 的 lambda 可以保存到 std::function 中。
          */
-        auto packagedTask = std::make_shared<std::packaged_task<ReturnType()>>(
+        auto userTask = std::make_shared<std::packaged_task<ReturnType()>>(
             [
                 callable = FunctionType(std::forward<F>(function)),
                 arguments = ArgumentsTuple(std::forward<Args>(args)...)
@@ -147,20 +165,48 @@ public:
             }
         );
         
-        // 拿到 future 准备返回给调用者
-        std::future<ReturnType> future = packagedTask->get_future();
+        auto taskAndFuture = MakeTask<ReturnType>(std::move(userTask));
+        
+        Dispatch(std::move(taskAndFuture.first));
+        
+        return std::move(taskAndFuture.second);
+    }
 
-        /**
-         * 将任务包装成 void() 类型的可调用对象，放入任务队列
-         * 
-         * 这里主要是因为 std::packaged_task 是 move-only 类型。
-         * Day 1 的任务队列保存 std::function<void()>，而 C++17 的 std::function 要求内部对象可复制。
-         * shared_ptr 本身可以复制，因此捕获 shared_ptr 的 lambda 可以保存到 std::function 中。
-         */
-        Enqueue([packagedTask]{
-            (*packagedTask)();
-        });
-        return future;
+    /**
+     * 提交可取消任务
+     * 
+     * 用户函数的第一个参数必须能够接收 CancellationToken
+     */
+    template <typename F, typename... Args>
+    auto SubmitCancelable(F&& function, Args&&... args)
+    {
+        using FunctionType = std::decay_t<F>;
+        using ArgumentsTuple = std::tuple<std::decay_t<Args>...>;
+        using ReturnType = std::invoke_result_t<FunctionType&&, CancellationToken, std::decay_t<Args>&&...>;
+
+        auto cancellationState = std::make_shared<detail::CancellationState>();
+        CancellationToken token(cancellationState);
+
+        auto userTask = [
+            callable = FunctionType(std::forward<F>(function)),
+            arguments = ArgumentsTuple(std::forward<Args>(args)...),
+            token
+        ]() mutable -> ReturnType {
+            /**
+             * 任务开始前已经取消时，不调用用户函数
+             */
+            token.ThrowIfCancellationRequested();
+
+            return std::apply([&callable, &token](auto&&... unpacked) mutable -> ReturnType {
+                return std::invoke(std::move(callable), token, std::forward<decltype(unpacked)>(unpacked)...);
+            }, std::move(arguments));
+        };
+
+        auto taskAndFuture = MakeTask<ReturnType>(std::move(userTask));
+
+        Dispatch(std::move(taskAndFuture.first));
+
+        return TaskHandle<ReturnType>(std::move(taskAndFuture.second), std::move(cancellationState));
     }
 
     /**
@@ -189,6 +235,15 @@ public:
      */
     RuntimeState GetState() const;
 
+     /**
+     * 当前仍在全局队列中等待的任务数量。
+     */
+    std::size_t PendingTaskCount() const;
+
+    ThreadPoolOptions GetOptions() const noexcept;
+
+    RuntimeMetricsSnapshot GetMetrics() const noexcept;
+
 private:
     enum class ShutdownMode {
         Drain,
@@ -196,9 +251,54 @@ private:
     };
 
     /**
-     * 将已经参数类型的任务放入任务队列
+     * 为用户任务增加：
+     *
+     * - packaged_task；
+     * - future；
+     * - 成功、失败和取消指标；
+     * - std::function<void()> 类型擦除。
      */
-    void Enqueue(Task task);
+    template <typename ReturnType, typename Callable>
+    std::pair<Task, std::future<ReturnType>> MakeTask(Callable&& callable)
+    {
+        using CallableType = std::decay_t<Callable>;
+
+        auto packagedTask = std::make_shared<std::packaged_task<ReturnType()>>(
+            [this, userCallable = CallableType(std::forward<Callable>(callable))] () mutable -> ReturnType {
+                try {
+                    if constexpr (std::is_void_v<ReturnType>) {
+                        std::invoke(std::move(userCallable));
+
+                        m_metrics.OnCompleted();
+                        return;
+                    } else {
+                        ReturnType result = std::invoke(std::move(userCallable));
+
+                        m_metrics.OnCompleted();
+                        return result;
+                    }
+                } catch (const TaskCancelled&) {
+                    m_metrics.OnCancelled();
+                    throw;
+                } catch (...) {
+                    m_metrics.OnFailed();
+                    throw;
+                }
+            }
+        );
+
+        std::future<ReturnType> future = packagedTask->get_future();
+        Task task = [packagedTask] {
+            (*packagedTask)();
+        };
+
+        return std::make_pair(std::move(task), std::move(future));
+    }
+
+    /**
+     * 根据队列状态和拒绝策略分发任务。
+     */
+    void Dispatch(Task task);
 
     /**
      * Shutdown 和 ShutdownNow 的公共实现。
@@ -210,18 +310,39 @@ private:
      */
     void WorkerLoop();
 
+    /**
+     * 当前正在运行的任务数量减一
+     */
+    void FinishTaskExecution() noexcept;
+
 private:
     RuntimeState m_state { RuntimeState::Created };
+    ThreadPoolOptions m_options;
 
     std::vector<std::thread> m_workers;
     std::queue<Task> m_tasks;
+    std::size_t m_activeTasks {0}; // 已经离开任务队列、当前正在执行的任务数量，包含工作线程任务和 CallerRuns 任务
 
-    /* 保护 m_tasks 和 m_state */
+    /* 保护 m_tasks、m_state、m_activeTasks */
     mutable std::mutex m_mutex;
-    std::condition_variable m_cv;
 
     /* 串行化多个并发的 Shutdown 调用 */
     std::mutex m_shutdownMutex;
+
+    /**
+     * 通知工作线程有任务可执行
+     */
+    std::condition_variable m_taskAvailableCv;
+
+    /**
+     * 通知 Block 策略下的提交线程队列出现空间
+     */
+    std::condition_variable m_queueNotFullCv;
+
+    /**
+     * 通知关闭线程所有活跃任务已经结束
+     */
+    std::condition_variable m_idleCv;
     
     /**
      * std::once_flag 是 C++ 11 引入的一个轻量级同步原语，位于 <mutex> 文件中。
@@ -237,6 +358,20 @@ private:
      * 此处用来保证 Stop() 中的停止和 join 逻辑只执行一次!
      */
     // std::once_flag m_stopOnce;
+
+    /**
+     * 线程池运行指标 
+     */
+    RuntimeMetrics m_metrics;
+
+    /**
+     * 标识当前线程是否正在执行本线程池任务
+     * 
+     * 用于：
+     *  - 防止任务内部调用 Shutdown 导致自 join；
+     *  - Block 策略下避免工作线程递归提交死锁。
+     */
+    static thread_local ThreadPool* m_currentPool;
 };
 
 } // namespace minirt
