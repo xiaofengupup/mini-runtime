@@ -5,12 +5,22 @@
 
 namespace minirt {
 
+thread_local ThreadPool* ThreadPool::m_currentPool = nullptr;
+
 ThreadPool::ThreadPool(std::size_t threadCount)
+    : ThreadPool(ThreadPoolOptions { threadCount, 1024, RejectionPolicy::Block }) {}
+
+ThreadPool::ThreadPool(ThreadPoolOptions options) : m_options(options)
 {
-    if (threadCount <= 0) {
+    if (m_options.threadCount <= 0) {
         throw std::invalid_argument("ThreadPool threadCount must be greater than zero");
     }
-    m_workers.reserve(threadCount); // 预分配内存
+
+    if (m_options.queueCapacity == 0) {
+        throw std::invalid_argument("ThreadPool queueCapacity must be greater than zero");
+    }
+
+    m_workers.reserve(m_options.threadCount); // 预分配内存
 
     /**
      * 在线程创建之前设置为 Running。
@@ -20,7 +30,7 @@ ThreadPool::ThreadPool(std::size_t threadCount)
     m_state = RuntimeState::Running;
 
     try {
-        for (std::size_t i = 0; i < threadCount; ++i) {
+        for (std::size_t i = 0; i < m_options.threadCount; ++i) {
             m_workers.emplace_back(&ThreadPool::WorkerLoop, this);
         }
     } catch (...) {
@@ -36,7 +46,8 @@ ThreadPool::ThreadPool(std::size_t threadCount)
             m_state = RuntimeState::Stopping;
         }
 
-        m_cv.notify_all();
+        m_taskAvailableCv.notify_all();
+        m_queueNotFullCv.notify_all();
 
         for (std::thread& worker : m_workers) {
             if (worker.joinable()) {
@@ -58,14 +69,15 @@ ThreadPool::~ThreadPool()
     Shutdown();
 }
 
-void ThreadPool::Enqueue(Task task)
+void ThreadPool::Dispatch(Task task)
 {
     if (task == nullptr) {
-        throw std::invalid_argument("ThreadPool cannot enqueue an empty task");
+        throw std::invalid_argument("ThreadPool cannot dispatch an empty task");
     }
 
+    bool runInCaller = false;
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::unique_lock<std::mutex> lock(m_mutex);
         /**
          * 只有 Running 状态可以接收新任务
          * 
@@ -77,14 +89,82 @@ void ThreadPool::Enqueue(Task task)
             throw std::runtime_error("Cannot submit task: ThreadPool is not running");
         }
         m_tasks.push(std::move(task));
+
+        switch (m_options.rejectPolicy) {
+            case RejectionPolicy::Block: {
+                /*
+                * 如果当前就是本线程的工作线程并且队列已满，继续阻塞可能产生递归提交，出现死锁
+                * 此时退化为 CallerRun，在当前工作线程中执行
+                */
+                if (m_tasks.size() >= m_options.queueCapacity && m_currentPool == this) {
+                    runInCaller = true;
+                } else {
+                    m_queueNotFullCv.wait(lock, [this] {
+                        return m_state != RuntimeState::Running || m_tasks.size() < m_options.queueCapacity;
+                    });
+
+                    if (m_state != RuntimeState::Running) {
+                        m_metrics.OnRejected();
+                        throw TaskRejected("ThreadPool stopped while submitter was waiting for queue space");
+                    }
+                }
+                break;
+            }
+
+            case RejectionPolicy::Reject: {
+                if (m_tasks.size() >= m_options.queueCapacity) {
+                    m_metrics.OnRejected();
+                    throw TaskRejected("Cannot submit task: task queue is full");
+                }
+                break;
+            }
+
+            case RejectionPolicy::CallerRun: {
+                if (m_tasks.size() >= m_options.queueCapacity) {
+                    runInCaller = true;
+                }
+                break;
+            }
+        
+            default:
+                break;
+        }
+
+        if (runInCaller) {
+            // CallerRuns 任务虽然不在工作线程中运行，仍然属于线程池已经接受的任务。
+            ++m_activeTasks;
+            m_metrics.OnSubmitted();
+            m_metrics.OnCallerRuns();
+        } else {
+            m_tasks.push(std::move(task));
+            m_metrics.OnSubmitted();
+        }
     }
+
+    // 必须在 m_mutex 外执行。
+    if (runInCaller) {
+        ThreadPool* previousPool = m_currentPool;
+        m_currentPool = this;
+
+        try {
+            task();
+        } catch (const std::exception& exception) {
+            std::cerr << "[MiniRuntime] internal task exception: " << exception.what()<< '\n';
+        } catch (...) {
+            std::cerr << "[MiniRuntime] unknown internal task exception\n";
+        }
+
+        m_currentPool = previousPool;
+        FinishTaskExecution();
+        return;
+    } 
 
     /*
      * 先释放 mutex，再通知工作线程
      * 
      * 即使在持有锁时调用 notify_one 通常也不会导致错误，但被唤醒的线程仍然需要等待当前线程释放 mutex。
      */
-    m_cv.notify_one();
+    m_taskAvailableCv.notify_one();
 }
 
 void ThreadPool::Shutdown()
@@ -99,6 +179,10 @@ void ThreadPool::ShutdownNow()
 
 void ThreadPool::ShutdownImpl(ShutdownMode mode)
 {
+    if (m_currentPool == this) {
+        throw std::logic_error("Shutdown cannot be called from a task running in this ThreadPool");
+    }
+
     /*
      * 防止多个线程同时执行 join。
      *
@@ -121,9 +205,21 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
         m_state = RuntimeState::Stopping;
         
         if (mode == ShutdownMode::DiscardPending) {
+            const std::size_t discardedCount = m_tasks.size();
             m_tasks.swap(discardedTasks);
+            m_metrics.OnDiscarded(discardedCount);
         }
     }
+
+    /*
+     * 
+     * 同时唤醒：
+     * 
+     * 1. 等待任务的工作线程
+     * 2. 等待队列空间的 Block 提交线程
+     */
+    m_taskAvailableCv.notify_all();
+    m_queueNotFullCv.notify_all();
 
     /**
      * 在任务队列锁外销毁被丢弃的任务
@@ -135,14 +231,6 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
         discardedTasks.swap(empty);
     }
 
-    /*
-     * 所有休眠线程都需要醒来
-     * 
-     * 1. 队列中有任务的线程继续执行任务；
-     * 2. 队列为空的线程检查通知条件并退出；
-     */
-    m_cv.notify_all();
-
     for (std::thread& worker : m_workers) {
         if (worker.joinable()) {
             worker.join();
@@ -150,7 +238,10 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
     }
 
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_idleCv.wait(lock, [this] {
+            return m_activeTasks == 0;
+        });
         m_state = RuntimeState::Stopped;
     }
 }
@@ -161,8 +252,26 @@ RuntimeState ThreadPool::GetState() const
     return m_state;
 }
 
+std::size_t ThreadPool::PendingTaskCount() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_tasks.size();
+}
+
+ThreadPoolOptions ThreadPool::GetOptions() const noexcept
+{
+    return m_options;
+}
+
+RuntimeMetricsSnapshot ThreadPool::GetMetrics() const noexcept
+{
+    return m_metrics.GetSnapshot();
+}
+
 void ThreadPool::WorkerLoop()
 {
+    m_currentPool = this;
+
     while (true) {
         Task task;
         {
@@ -179,7 +288,7 @@ void ThreadPool::WorkerLoop()
             /*
              * 条件变量可能发生虚假唤醒，所以线程唤醒不代表一定存在任务，因此每次醒来都必须重新检查条件
              */
-            m_cv.wait(lock, [this] {
+            m_taskAvailableCv.wait(lock, [this] {
                 return m_state != RuntimeState::Running || !m_tasks.empty();
             });
 
@@ -192,7 +301,12 @@ void ThreadPool::WorkerLoop()
 
             task = std::move(m_tasks.front());
             m_tasks.pop();
+
+            ++m_activeTasks;
         }
+
+        // 从队列取走一个任务后，队列出现新空间。
+        m_queueNotFullCv.notify_one();
 
         /*
          * 必须在锁外执行任务，如果持有 mutex 执行任务：
@@ -213,6 +327,21 @@ void ThreadPool::WorkerLoop()
         } catch (...) {
             std::cerr << "[MiniRuntime] unknown internal task exception\n";
         }
+
+        FinishTaskExecution();
+    }
+}
+
+void ThreadPool::FinishTaskExecution() noexcept
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_activeTasks > 0) {
+        m_activeTasks--;
+    }
+
+    if (m_activeTasks == 0 && m_tasks.empty()) {
+        m_idleCv.notify_all();
     }
 }
 
