@@ -126,7 +126,7 @@ static thread_local ThreadPool* current_pool_;
 当满足：
 
 ```cpp
-m_currentPool == this && m_tasks.size() >= queueCapacity
+m_currentPool == this && m_globalTasks.size() >= queueCapacity
 ```
 
 时，Block 策略退化为当前线程直接执行，避免唯一工作线程阻塞等待自身释放队列空间。
@@ -136,7 +136,7 @@ m_currentPool == this && m_tasks.size() >= queueCapacity
 
 ## m_activeTasks
 
-任务从队列取出后，不再属于 `m_tasks`，但它仍然没有完成。
+任务从队列取出后，不再属于 `m_globalTasks`，但它仍然没有完成。
 
 因此线程池增加：`std::size_t m_activeTasks` 统计已经开始运行但尚未结束的任务。
 
