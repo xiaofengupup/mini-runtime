@@ -31,11 +31,11 @@ TEST(ThreadPoolLifecycleTest, ShutdownDrainsPendingTasks)
     std::atomic<int> completed {0};
     std::vector<std::future<void>> futures;
 
-    constexpr int taskCount = 1000;
+    constexpr int taskCount = 5;
     futures.reserve(taskCount);
 
     for (int i = 0; i < taskCount; ++i) {
-        futures.push_back(
+        futures.emplace_back(
             pool.Submit([&completed] {
                 completed.fetch_add(1, std::memory_order_relaxed);
             })

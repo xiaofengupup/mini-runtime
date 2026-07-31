@@ -16,7 +16,7 @@ struct ThreadPoolOptions {
     std::size_t queueCapacity {1024};
 
     // 队列已满时的处理策略
-    RejectionPolicy rejectPolicy {RejectionPolicy::Block};
+    RejectionPolicy rejectionPolicy {RejectionPolicy::Block};
 };
 
 } // namespace minirt

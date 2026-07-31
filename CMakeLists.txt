@@ -56,6 +56,9 @@ if(BUILD_TESTING)
     add_executable(minirt_tests
         tests/test_thread_pool.cpp
         tests/test_submit.cpp
+        tests/test_backpressure.cpp
+        tests/test_cancellation.cpp
+        tests/test_metrics.cpp
     )
 
     target_link_libraries(minirt_tests PRIVATE

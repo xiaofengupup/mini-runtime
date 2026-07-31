@@ -86,15 +86,15 @@ void ThreadPool::Dispatch(Task task)
          * 2. 如果 Shutdown 先获得锁，Submit 被拒绝；
          */
         if (m_state != RuntimeState::Running) {
+            m_metrics.OnRejected();
             throw std::runtime_error("Cannot submit task: ThreadPool is not running");
         }
-        m_tasks.push(std::move(task));
 
-        switch (m_options.rejectPolicy) {
+        switch (m_options.rejectionPolicy) {
             case RejectionPolicy::Block: {
                 /*
                 * 如果当前就是本线程的工作线程并且队列已满，继续阻塞可能产生递归提交，出现死锁
-                * 此时退化为 CallerRun，在当前工作线程中执行
+                * 此时退化为 CallerRuns，在当前工作线程中执行
                 */
                 if (m_tasks.size() >= m_options.queueCapacity && m_currentPool == this) {
                     runInCaller = true;
@@ -119,7 +119,7 @@ void ThreadPool::Dispatch(Task task)
                 break;
             }
 
-            case RejectionPolicy::CallerRun: {
+            case RejectionPolicy::CallerRuns: {
                 if (m_tasks.size() >= m_options.queueCapacity) {
                     runInCaller = true;
                 }
@@ -296,6 +296,7 @@ void ThreadPool::WorkerLoop()
              * 走到这里且队列为空，说明线程池已经进入 Stopping 状态。
              */
             if (m_tasks.empty()) {
+                m_currentPool = nullptr;
                 return;
             }
 

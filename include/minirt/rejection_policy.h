@@ -13,7 +13,7 @@ namespace minirt {
 enum class RejectionPolicy {
     Block,      // 阻塞提交线程，直到任务队列出现空间
     Reject,     // 立即拒绝任务，并抛出 TaskRejected
-    CallerRun,  // 由提交任务的线程直接执行任务
+    CallerRuns,  // 由提交任务的线程直接执行任务
 };
 
 /**
