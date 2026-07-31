@@ -245,7 +245,7 @@ bool ThreadPool::TrySteal(std::size_t workerIndex, Task& task)
     const std::size_t workerCount = m_localQueues.size();
 
     for (std::size_t offset = 1; offset < workerCount; ++offset) {
-        const std::size_t victimIndex = (workerIndex + offset) & workerCount;
+        const std::size_t victimIndex = (workerIndex + offset) % workerCount;
         if (m_localQueues[victimIndex]->TrySteal(task)) {
             m_pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
             m_metrics.OnStolen();
@@ -328,7 +328,7 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
     std::vector<Task> discardedTasks;
     {
         std::lock_guard<std::mutex> taskLock(m_mutex);
-        
+
         if (m_state == RuntimeState::Stopped) {
             return;
         }
@@ -354,7 +354,7 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
 
         const std::size_t discardedCount = discardedTasks.size();
         if (discardedCount > 0) {
-            m_pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
+            m_pendingTasks.fetch_sub(discardedCount, std::memory_order_acq_rel);
             m_metrics.OnDiscarded(static_cast<std::uint64_t>(discardedCount));
         }
     }
@@ -394,6 +394,13 @@ void ThreadPool::WorkerLoop(std::size_t workerIndex)
     m_currentPool = this;
     m_currentWorkerIndex = workerIndex;
 
+    if (workerIndex >= m_localQueues.size()) {
+        std::cerr << "[MiniRuntime] invalid worker index: " << workerIndex
+            << ", queue count: " << m_localQueues.size() << '\n';
+
+        std::terminate();
+    }
+
     while (true) {
         if (m_discardPending.load(std::memory_order_acquire)) {
             break;
@@ -402,7 +409,7 @@ void ThreadPool::WorkerLoop(std::size_t workerIndex)
         Task task;
         if (TryGetTask(workerIndex, task)) {
             {
-                std::unique_lock<std::mutex> lock(m_mutex);
+                std::lock_guard<std::mutex> lock(m_mutex);
                 ++m_activeTasks;
             }
 
@@ -431,7 +438,7 @@ void ThreadPool::WorkerLoop(std::size_t workerIndex)
          * 条件变量可能发生虚假唤醒，所以线程唤醒不代表一定存在任务，因此每次醒来都必须重新检查条件
          */
         m_taskAvailableCv.wait(lock, [this] {
-            return m_state != RuntimeState::Running || !m_pendingTasks.load(std::memory_order_acquire) > 0;
+            return m_state != RuntimeState::Running || m_pendingTasks.load(std::memory_order_acquire) > 0;
         });
 
         const bool shouldExit = 
