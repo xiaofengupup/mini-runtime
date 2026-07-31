@@ -59,6 +59,8 @@ if(BUILD_TESTING)
         tests/test_backpressure.cpp
         tests/test_cancellation.cpp
         tests/test_metrics.cpp
+        tests/test_work_stealing_queue.cpp
+        tests/test_work_stealing.cpp
     )
 
     target_link_libraries(minirt_tests PRIVATE
@@ -74,5 +76,8 @@ if(BUILD_TESTING)
 
     # CMake 官方则推荐使用 gtest_discover_tests()，它会从测试程序中自动发现每个 TEST，并分别注册到 CTest
     include(GoogleTest)
-    gtest_discover_tests(minirt_tests)
+    gtest_discover_tests(minirt_tests
+        PROPERTIES
+            TIMEOUT 10
+    )
 endif()
