@@ -17,6 +17,8 @@
 #include <tuple>
 #include <future>
 #include <memory>
+#include <type_traits>
+#include <utility>
 
 namespace minirt {
 
@@ -156,15 +158,12 @@ public:
          * Day 1 的任务队列保存 std::function<void()>，而 C++17 的 std::function 要求内部对象可复制。
          * shared_ptr 本身可以复制，因此捕获 shared_ptr 的 lambda 可以保存到 std::function 中。
          */
-        auto userTask = std::make_shared<std::packaged_task<ReturnType()>>(
-            [
-                callable = FunctionType(std::forward<F>(function)),
-                arguments = ArgumentsTuple(std::forward<Args>(args)...)
-            ]() mutable -> ReturnType {
-                return std::apply(std::move(callable), std::move(arguments));
-            }
-        );
-        
+
+        auto userTask = [callable = FunctionType(std::forward<F>(function)),
+                         arguments = ArgumentsTuple(std::forward<Args>(args)...)]() mutable -> ReturnType {
+            return std::apply(std::move(callable), std::move(arguments));
+        };
+
         auto taskAndFuture = MakeTask<ReturnType>(std::move(userTask));
         
         Dispatch(std::move(taskAndFuture.first));

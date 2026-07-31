@@ -81,7 +81,7 @@ private:
     friend class ThreadPool;
 
     TaskHandle(std::future<T>&& future, std::shared_ptr<detail::CancellationState> state)
-        : future(std::move(future)), m_state(std::move(m_state)) {}
+        : m_future(std::move(future)), m_state(std::move(state)) {}
 
 private:
     std::future<T> m_future; // std::future 本身是 move-only 类型，所以整个 TaskHandle 不支持拷贝
