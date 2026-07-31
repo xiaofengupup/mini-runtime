@@ -7,6 +7,7 @@
 #include "minirt/runtime_metrics.h"
 #include "minirt/task_handle.h"
 #include "minirt/thread_pool_options.h"
+#include "minirt/work_stealing_queue.h"
 
 #include <vector>
 #include <thread>
@@ -235,9 +236,9 @@ public:
     RuntimeState GetState() const;
 
      /**
-     * 当前仍在全局队列中等待的任务数量。
+     * 返回全局队列和所有工作线程本地队列中尚未开始执行的任务总数
      */
-    std::size_t PendingTaskCount() const;
+    std::size_t PendingTaskCount() const noexcept;
 
     ThreadPoolOptions GetOptions() const noexcept;
 
@@ -299,6 +300,14 @@ private:
      */
     void Dispatch(Task task);
 
+    bool TryGetTask(std::size_t workerIndex, Task& task);
+
+    bool TryPopLocal(std::size_t workerIndex, Task& task);
+
+    bool TryPopGlobal(Task& task);
+
+    bool TrySteal(std::size_t workerIndex, Task& task);
+
     /**
      * Shutdown 和 ShutdownNow 的公共实现。
      */
@@ -307,7 +316,7 @@ private:
     /**
      * 工作线程执行函数
      */
-    void WorkerLoop();
+    void WorkerLoop(std::size_t workerIndex);
 
     /**
      * 当前正在运行的任务数量减一
@@ -316,11 +325,25 @@ private:
 
 private:
     RuntimeState m_state { RuntimeState::Created };
+    
+    std::vector<std::thread> m_workers;
+    
+    // 外部线程提交的有界全局队列
+    std::queue<Task> m_globalTasks; 
+
+    // 每个工作线程拥有一个本地双端队列
+    std::vector<std::unique_ptr<WorkStealingQueue<Task>>> m_localQueues; 
+
     ThreadPoolOptions m_options;
 
-    std::vector<std::thread> m_workers;
-    std::queue<Task> m_tasks;
-    std::size_t m_activeTasks {0}; // 已经离开任务队列、当前正在执行的任务数量，包含工作线程任务和 CallerRuns 任务
+    // 已经离开任务队列、当前正在执行的任务数量，包含工作线程任务和 CallerRuns 任务
+    std::size_t m_activeTasks {0}; 
+
+    // 全局队列与所有本地队列中的待执行任务总数
+    std::atomic<std::size_t> m_pendingTasks {0};
+
+    // ShutdownNow 开始后，工作线程停止从队列获取新任务。
+    std::atomic<bool> m_discardPending {false};
 
     /* 保护 m_tasks、m_state、m_activeTasks */
     mutable std::mutex m_mutex;
@@ -371,6 +394,10 @@ private:
      *  - Block 策略下避免工作线程递归提交死锁。
      */
     static thread_local ThreadPool* m_currentPool;
+
+    static thread_local std::size_t m_currentWorkerIndex;
+
+    static constexpr std::size_t m_kNoWorker = std::numeric_limits<std::size_t>::max();
 };
 
 } // namespace minirt

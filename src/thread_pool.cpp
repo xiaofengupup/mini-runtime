@@ -6,6 +6,7 @@
 namespace minirt {
 
 thread_local ThreadPool* ThreadPool::m_currentPool = nullptr;
+thread_local std::size_t ThreadPool::m_currentWorkerIndex = ThreadPool::m_kNoWorker;
 
 ThreadPool::ThreadPool(std::size_t threadCount)
     : ThreadPool(ThreadPoolOptions { threadCount, 1024, RejectionPolicy::Block }) {}
@@ -20,6 +21,14 @@ ThreadPool::ThreadPool(ThreadPoolOptions options) : m_options(options)
         throw std::invalid_argument("ThreadPool queueCapacity must be greater than zero");
     }
 
+    /**
+     * m_localQueues 中的对象包含 mutex，因此通过 unique_ptr 保存，避免 vector 扩容时要求队列可移动
+     */
+    m_localQueues.reserve(m_options.threadCount);
+    for (std::size_t i = 0; i < m_options.threadCount; ++i) {
+        m_localQueues.push_back(std::make_unique<WorkStealingQueue<Task>>());
+    }
+
     m_workers.reserve(m_options.threadCount); // 预分配内存
 
     /**
@@ -31,7 +40,7 @@ ThreadPool::ThreadPool(ThreadPoolOptions options) : m_options(options)
 
     try {
         for (std::size_t i = 0; i < m_options.threadCount; ++i) {
-            m_workers.emplace_back(&ThreadPool::WorkerLoop, this);
+            m_workers.emplace_back(&ThreadPool::WorkerLoop, this, i);
         }
     } catch (...) {
         /*
@@ -44,6 +53,7 @@ ThreadPool::ThreadPool(ThreadPoolOptions options) : m_options(options)
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_state = RuntimeState::Stopping;
+            m_discardPending.store(true, std::memory_order_release);
         }
 
         m_taskAvailableCv.notify_all();
@@ -76,6 +86,8 @@ void ThreadPool::Dispatch(Task task)
     }
 
     bool runInCaller = false;
+    bool notifyWorker = false;
+    const bool isWorkerThread = (m_currentPool == this && m_currentWorkerIndex != m_kNoWorker);
     {
         std::unique_lock<std::mutex> lock(m_mutex);
         /**
@@ -90,61 +102,92 @@ void ThreadPool::Dispatch(Task task)
             throw std::runtime_error("Cannot submit task: ThreadPool is not running");
         }
 
-        switch (m_options.rejectionPolicy) {
-            case RejectionPolicy::Block: {
-                /*
-                * 如果当前就是本线程的工作线程并且队列已满，继续阻塞可能产生递归提交，出现死锁
-                * 此时退化为 CallerRuns，在当前工作线程中执行
-                */
-                if (m_tasks.size() >= m_options.queueCapacity && m_currentPool == this) {
-                    runInCaller = true;
-                } else {
-                    m_queueNotFullCv.wait(lock, [this] {
-                        return m_state != RuntimeState::Running || m_tasks.size() < m_options.queueCapacity;
-                    });
+        if (isWorkerThread) {
+            /*
+             * 工作线程内部提交
+             *
+             * 单工作线程中，如果子任务入队，当前任务随后等待子任务 future，很容易产生自我死锁。
+             * 因此单线程池内部提交直接执行。
+             */
+            if (m_options.threadCount == 1) {
+                runInCaller = true;
+                ++m_activeTasks;
 
-                    if (m_state != RuntimeState::Running) {
-                        m_metrics.OnRejected();
-                        throw TaskRejected("ThreadPool stopped while submitter was waiting for queue space");
-                    }
-                }
-                break;
+                m_metrics.OnSubmitted();
+                m_metrics.OnCallerRuns();
+            } else {
+                m_localQueues[m_currentWorkerIndex]->Push(std::move(task));
+                m_pendingTasks.fetch_add(1, std::memory_order_release);
+
+                m_metrics.OnSubmitted();
+                m_metrics.OnLocalSubmitted();
+
+                notifyWorker = true;
             }
-
-            case RejectionPolicy::Reject: {
-                if (m_tasks.size() >= m_options.queueCapacity) {
-                    m_metrics.OnRejected();
-                    throw TaskRejected("Cannot submit task: task queue is full");
-                }
-                break;
-            }
-
-            case RejectionPolicy::CallerRuns: {
-                if (m_tasks.size() >= m_options.queueCapacity) {
-                    runInCaller = true;
-                }
-                break;
-            }
-        
-            default:
-                break;
-        }
-
-        if (runInCaller) {
-            // CallerRuns 任务虽然不在工作线程中运行，仍然属于线程池已经接受的任务。
-            ++m_activeTasks;
-            m_metrics.OnSubmitted();
-            m_metrics.OnCallerRuns();
         } else {
-            m_tasks.push(std::move(task));
-            m_metrics.OnSubmitted();
+            // 外部线程提交，仍然使用全局有界队列和 Day 3 的拒绝策略。
+            switch (m_options.rejectionPolicy) {
+                case RejectionPolicy::Block: {
+                    /*
+                    * 如果当前就是本线程的工作线程并且队列已满，继续阻塞可能产生递归提交，出现死锁
+                    * 此时退化为 CallerRuns，在当前工作线程中执行
+                    */
+                    if (m_globalTasks.size() >= m_options.queueCapacity && m_currentPool == this) {
+                        runInCaller = true;
+                    } else {
+                        m_queueNotFullCv.wait(lock, [this] {
+                            return m_state != RuntimeState::Running || m_globalTasks.size() < m_options.queueCapacity;
+                        });
+
+                        if (m_state != RuntimeState::Running) {
+                            m_metrics.OnRejected();
+                            throw TaskRejected("ThreadPool stopped while submitter was waiting for queue space");
+                        }
+                    }
+                    break;
+                }
+
+                case RejectionPolicy::Reject: {
+                    if (m_globalTasks.size() >= m_options.queueCapacity) {
+                        m_metrics.OnRejected();
+                        throw TaskRejected("Cannot submit task: task queue is full");
+                    }
+                    break;
+                }
+
+                case RejectionPolicy::CallerRuns: {
+                    if (m_globalTasks.size() >= m_options.queueCapacity) {
+                        runInCaller = true;
+                    }
+                    break;
+                }
+            
+                default:
+                    break;
+            }
+
+            if (runInCaller) {
+                // CallerRuns 任务虽然不在工作线程中运行，仍然属于线程池已经接受的任务。
+                ++m_activeTasks;
+                m_metrics.OnSubmitted();
+                m_metrics.OnCallerRuns();
+            } else {
+                m_globalTasks.push(std::move(task));
+
+                m_pendingTasks.fetch_add(1, std::memory_order_release);
+                m_metrics.OnSubmitted();
+                notifyWorker = true;
+            }
         }
     }
 
     // 必须在 m_mutex 外执行。
     if (runInCaller) {
         ThreadPool* previousPool = m_currentPool;
+        const std::size_t previousWorkIndex = m_currentWorkerIndex;
+
         m_currentPool = this;
+        m_currentWorkerIndex = m_kNoWorker;
 
         try {
             task();
@@ -155,6 +198,7 @@ void ThreadPool::Dispatch(Task task)
         }
 
         m_currentPool = previousPool;
+        m_currentWorkerIndex = previousWorkIndex;
         FinishTaskExecution();
         return;
     } 
@@ -164,7 +208,72 @@ void ThreadPool::Dispatch(Task task)
      * 
      * 即使在持有锁时调用 notify_one 通常也不会导致错误，但被唤醒的线程仍然需要等待当前线程释放 mutex。
      */
-    m_taskAvailableCv.notify_one();
+    if (notifyWorker) {
+        m_taskAvailableCv.notify_one();
+    }
+}
+
+bool ThreadPool::TryPopLocal(std::size_t workerIndex, Task& task)
+{
+    if (!m_localQueues[workerIndex]->TryPop(task)) {
+        return false;
+    }
+
+    m_pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
+    return true;
+}
+
+bool ThreadPool::TryPopGlobal(Task& task)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_globalTasks.empty()) {
+            return false;
+        }
+
+        task = std::move(m_globalTasks.front());
+        m_globalTasks.pop();
+    }
+    
+    m_pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
+    m_queueNotFullCv.notify_one();
+    return true;
+}
+
+bool ThreadPool::TrySteal(std::size_t workerIndex, Task& task)
+{
+    const std::size_t workerCount = m_localQueues.size();
+
+    for (std::size_t offset = 1; offset < workerCount; ++offset) {
+        const std::size_t victimIndex = (workerIndex + offset) & workerCount;
+        if (m_localQueues[victimIndex]->TrySteal(task)) {
+            m_pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
+            m_metrics.OnStolen();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ThreadPool::TryGetTask(std::size_t workerIndex, Task& task)
+{
+    if (m_discardPending.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    // 1.优先执行自己的本地任务
+    if (TryPopLocal(workerIndex, task)) {
+        return true;
+    }
+
+    // 2.再处理外部提交的全局任务
+    if (TryPopGlobal(task)) {
+        return true;
+    }
+
+    // 3.最后尝试窃取其它 worker
+    return TrySteal(workerIndex, task);
 }
 
 void ThreadPool::Shutdown()
@@ -175,6 +284,27 @@ void ThreadPool::Shutdown()
 void ThreadPool::ShutdownNow()
 {
     ShutdownImpl(ShutdownMode::DiscardPending);
+}
+
+RuntimeState ThreadPool::GetState() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_state;
+}
+
+std::size_t ThreadPool::PendingTaskCount() const noexcept
+{
+    return m_pendingTasks.load(std::memory_order_acquire);
+}
+
+ThreadPoolOptions ThreadPool::GetOptions() const noexcept
+{
+    return m_options;
+}
+
+RuntimeMetricsSnapshot ThreadPool::GetMetrics() const noexcept
+{
+    return m_metrics.GetSnapshot();
 }
 
 void ThreadPool::ShutdownImpl(ShutdownMode mode)
@@ -193,9 +323,9 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
     /**
      * shutdown 丢弃的任务暂存在局部队列中
      * 
-     * 先在 m_mutex 保护下与 m_tasks 进行交换，再在锁外销毁，避免在持有任务队列锁时执行大量析构操作
+     * 先在 m_mutex 保护下与 m_globalTasks 进行交换，再在锁外销毁，避免在持有任务队列锁时执行大量析构操作
      */
-    std::queue<Task> discardedTasks;
+    std::vector<Task> discardedTasks;
     {
         std::lock_guard<std::mutex> taskLock(m_mutex);
         
@@ -205,9 +335,27 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
         m_state = RuntimeState::Stopping;
         
         if (mode == ShutdownMode::DiscardPending) {
-            const std::size_t discardedCount = m_tasks.size();
-            m_tasks.swap(discardedTasks);
-            m_metrics.OnDiscarded(discardedCount);
+            while (!m_globalTasks.empty()) {
+                discardedTasks.emplace_back(std::move(m_globalTasks.front()));
+                m_globalTasks.pop();
+            }
+        }
+    }
+
+    if (mode == ShutdownMode::DiscardPending) {
+        /*
+         * m_state 已经变为 Stopping，后续 Submit 无法再向本地队列入队。
+         *
+         * 工作线程也会在下一轮检查 m_discardPending 后停止取新任务。
+         */
+        for (const auto& localQueue : m_localQueues) {
+            localQueue->DrainTo(discardedTasks);
+        }
+
+        const std::size_t discardedCount = discardedTasks.size();
+        if (discardedCount > 0) {
+            m_pendingTasks.fetch_sub(1, std::memory_order_acq_rel);
+            m_metrics.OnDiscarded(static_cast<std::uint64_t>(discardedCount));
         }
     }
 
@@ -223,13 +371,8 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
 
     /**
      * 在任务队列锁外销毁被丢弃的任务
-     * 
-     * 被丢弃 packaged_task 的共享状态会进入 broken promise 状态，对应的 future.get() 将抛出 std::future_error。
      */
-    {
-        std::queue<Task> empty;
-        discardedTasks.swap(empty);
-    }
+    discardedTasks.clear();
 
     for (std::thread& worker : m_workers) {
         if (worker.joinable()) {
@@ -246,91 +389,61 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
     }
 }
 
-RuntimeState ThreadPool::GetState() const
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_state;
-}
-
-std::size_t ThreadPool::PendingTaskCount() const
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_tasks.size();
-}
-
-ThreadPoolOptions ThreadPool::GetOptions() const noexcept
-{
-    return m_options;
-}
-
-RuntimeMetricsSnapshot ThreadPool::GetMetrics() const noexcept
-{
-    return m_metrics.GetSnapshot();
-}
-
-void ThreadPool::WorkerLoop()
+void ThreadPool::WorkerLoop(std::size_t workerIndex)
 {
     m_currentPool = this;
+    m_currentWorkerIndex = workerIndex;
 
     while (true) {
-        Task task;
-        {
-            /**
-             * 这里使用 unique_lock 是因为 condition_variable::wait() 在等待过程中需要：
-             * 1. 自动释放 m_mutex
-             * 2. 进入休眠
-             * 3. 被唤醒后重新获取 mutex
-             * 4. 返回调用代码
-             * 
-             * std::lock_guard 不支持中途主动结果和重新加锁，因此条件变量通常搭配 st::unique_lock。
-             */
-            std::unique_lock<std::mutex> lock(m_mutex);
-            /*
-             * 条件变量可能发生虚假唤醒，所以线程唤醒不代表一定存在任务，因此每次醒来都必须重新检查条件
-             */
-            m_taskAvailableCv.wait(lock, [this] {
-                return m_state != RuntimeState::Running || !m_tasks.empty();
-            });
+        if (m_discardPending.load(std::memory_order_acquire)) {
+            break;
+        }
 
-            /*
-             * 走到这里且队列为空，说明线程池已经进入 Stopping 状态。
-             */
-            if (m_tasks.empty()) {
-                m_currentPool = nullptr;
-                return;
+        Task task;
+        if (TryGetTask(workerIndex, task)) {
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                ++m_activeTasks;
             }
 
-            task = std::move(m_tasks.front());
-            m_tasks.pop();
-
-            ++m_activeTasks;
+            try {
+                task();
+            } catch (const std::exception& e) {
+                std::cerr << "[MiniRuntime] internal task exception: " << e.what() << '\n';
+            } catch (...) {
+                std::cerr << "[MiniRuntime] unknown internal task exception\n";
+            }
+            FinishTaskExecution();
+            continue;
         }
 
-        // 从队列取走一个任务后，队列出现新空间。
-        m_queueNotFullCv.notify_one();
-
-        /*
-         * 必须在锁外执行任务，如果持有 mutex 执行任务：
-         * 1. 其他工作线程无法获取任务；
-         * 2. 提交线程也无法提交新任务；
-         * 3. 整个线程池可能退化为串行执行；
-         * 4. 任务中再次调用 Submit 时容易产生问题
+        /**
+         * 这里使用 unique_lock 是因为 condition_variable::wait() 在等待过程中需要：
+         * 1. 自动释放 m_mutex
+         * 2. 进入休眠
+         * 3. 被唤醒后重新获取 mutex
+         * 4. 返回调用代码
          * 
-         * 此外，这里继续保留最后一道异常保护。
-         * 
-         * 正常情况下，用户函数抛出的异常会被 packaged_task 捕获并写入 future，不会传播到这里。
-         * 这里主要防御未来加入的内部任务包装器发生异常。
+         * std::lock_guard 不支持中途主动结果和重新加锁，因此条件变量通常搭配 st::unique_lock。
          */
-        try {
-            task();
-        } catch (const std::exception& e) {
-            std::cerr << "[MiniRuntime] internal task exception: " << e.what() << '\n';
-        } catch (...) {
-            std::cerr << "[MiniRuntime] unknown internal task exception\n";
-        }
+        std::unique_lock<std::mutex> lock(m_mutex);
+        /*
+         * 条件变量可能发生虚假唤醒，所以线程唤醒不代表一定存在任务，因此每次醒来都必须重新检查条件
+         */
+        m_taskAvailableCv.wait(lock, [this] {
+            return m_state != RuntimeState::Running || !m_pendingTasks.load(std::memory_order_acquire) > 0;
+        });
 
-        FinishTaskExecution();
+        const bool shouldExit = 
+            (m_state != RuntimeState::Running) &&
+            (m_discardPending.load(std::memory_order_acquire) || m_pendingTasks.load(std::memory_order_acquire) == 0);
+        if (shouldExit) {
+            break;
+        }
     }
+
+    m_currentWorkerIndex = m_kNoWorker;
+    m_currentPool = nullptr;
 }
 
 void ThreadPool::FinishTaskExecution() noexcept
@@ -341,7 +454,7 @@ void ThreadPool::FinishTaskExecution() noexcept
         m_activeTasks--;
     }
 
-    if (m_activeTasks == 0 && m_tasks.empty()) {
+    if (m_activeTasks == 0 && m_pendingTasks.load(std::memory_order_acquire) == 0) {
         m_idleCv.notify_all();
     }
 }
