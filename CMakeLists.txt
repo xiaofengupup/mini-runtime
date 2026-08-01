@@ -61,6 +61,7 @@ if(BUILD_TESTING)
         tests/test_metrics.cpp
         tests/test_work_stealing_queue.cpp
         tests/test_work_stealing.cpp
+        tests/test_stress.cpp
     )
 
     target_link_libraries(minirt_tests PRIVATE
@@ -78,6 +79,6 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(minirt_tests
         PROPERTIES
-            TIMEOUT 10
+            TIMEOUT 30
     )
 endif()

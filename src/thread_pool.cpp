@@ -99,7 +99,7 @@ void ThreadPool::Dispatch(Task task)
          */
         if (m_state != RuntimeState::Running) {
             m_metrics.OnRejected();
-            throw std::runtime_error("Cannot submit task: ThreadPool is not running");
+            throw TaskRejected("Cannot submit task: ThreadPool is not running");
         }
 
         if (isWorkerThread) {
