@@ -8,6 +8,10 @@ project(MiniRuntime VERSION 0.1.0 LANGUAGES CXX)
 option(MINIRT_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(MINIRT_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 option(MINIRT_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+
+# -----------------------------
+# 基准测试配置
+# -----------------------------
 option(MINIRT_BUILD_BENCHMARKS "Build MiniRuntime benchmarks" ON)
 
 include(${PROJECT_SOURCE_DIR}/cmake/Sanitizers.cmake)
@@ -46,6 +50,28 @@ target_compile_options(minirt PRIVATE
 )
 
 minirt_enable_sanitizers(minirt)
+
+# -----------------------------
+# 简单基准测试
+# -----------------------------
+if (MINIRT_BUILD_BENCHMARKS)
+    add_executable(minirt_benchmark
+        benchmarks/benchmark_runtime.cpp
+    )
+
+    target_link_libraries(minirt_benchmark PRIVATE
+        minirt
+    )
+
+    target_compile_options(minirt_benchmark PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+
+    minirt_enable_sanitizers(minirt_benchmark)
+endif()
+
 
 # -----------------------------
 # 单元测试
