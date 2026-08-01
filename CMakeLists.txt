@@ -3,6 +3,16 @@ cmake_minimum_required(VERSION 3.16)
 project(MiniRuntime VERSION 0.1.0 LANGUAGES CXX)
 
 # -----------------------------
+# Sanitizer 配置
+# -----------------------------
+option(MINIRT_ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(MINIRT_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+option(MINIRT_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(MINIRT_BUILD_BENCHMARKS "Build MiniRuntime benchmarks" ON)
+
+include(${PROJECT_SOURCE_DIR}/cmake/Sanitizers.cmake)
+
+# -----------------------------
 # 设置 C++ 标准
 # -----------------------------
 set(CMAKE_CXX_STANDARD 17)
@@ -34,6 +44,8 @@ target_compile_options(minirt PRIVATE
     -Wextra
     -Wpedantic
 )
+
+minirt_enable_sanitizers(minirt)
 
 # -----------------------------
 # 单元测试
@@ -74,6 +86,8 @@ if(BUILD_TESTING)
         -Wextra
         -Wpedantic
     )
+
+    minirt_enable_sanitizers(minirt_tests)
 
     # CMake 官方则推荐使用 gtest_discover_tests()，它会从测试程序中自动发现每个 TEST，并分别注册到 CTest
     include(GoogleTest)

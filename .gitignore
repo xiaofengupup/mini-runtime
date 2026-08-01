@@ -25,3 +25,6 @@ Makefile
 *.so
 *.dylib
 *.exe
+
+# third_party
+third_party/
