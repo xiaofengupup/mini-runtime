@@ -86,7 +86,7 @@ public:
      * 
      * decay-copy：退化拷贝，理解这一概念是掌握异步任务的关键。
      *   问题场景：生命周期与安全引用。
-     *   当调用 Submit 函数时，传入的参数可能是左值引用（例如 int&）、优质引用或者是带 const/volatile 修饰符的类型。
+     *   当调用 Submit 函数时，传入的参数可能是左值引用（例如 int&）、右值引用或者是带 const/volatile 修饰符的类型。
      *   如果直接使用原类型 F 和 Args... 去存储：
      *     - 如果用户传进来一个局部变量的引用（例如 int x = 10; Submit(func, x);），此时 Args 会被推导为 int&；
      *     - 异步任务的特点：Submit 函数会立即返回，而任务 Task 会在未来的某个时刻在另一个线程执行。
@@ -135,32 +135,11 @@ public:
          */
         using ReturnType = std::invoke_result_t<FunctionType&&, std::decay_t<Args>&&...>;
 
-        /*
-         * std::packaged_task 是 C++ 11 引入的一个非常强大的异步任务打包工具。
-         * std::packaged_task<Signature> 是一个模板类，它的模板参数 Signature 是一个函数签名（例如 int(int, double) 或者 void()）。
-         * 它主要做两件事情：
-         *   1. 打包装可调用对象：它可以把任何可调用对象（普通函数、lambda、std::bind、仿函数）打包起来。
-         *   2. 连接 std::future：它内部关联了一个异步状态。当在某个线程中调用这个 packaged_task 时，
-         *      它的执行结果（返回值或者抛出的异常）会自动写入这个异步状态中；而持有对应 std::future 的线程就可以获取这个结果。
-         *
-         * packaged_task 负责：
-         * 1. 执行用户函数；
-         * 2. 保存返回值；
-         * 3. 捕获用户函数抛出的异常；
-         * 4. 将结果或异常写入 future 的共享状态；
-         * 
-         * 这里创建一个无参形式的 packaged_task，签名是 ReturnType()
-         * 由于 packaged_task 不支持拷贝（只能 move），为了能方便地放进 std::function 任务队列，
-         * 通常用 std::make_shared 将其包裹在智能指针中。
-         * 
-         * 将任务包装成 void() 类型的可调用对象，放入任务队列
-         * 
-         * 主要是因为 std::packaged_task 是 move-only 类型。
-         * Day 1 的任务队列保存 std::function<void()>，而 C++17 的 std::function 要求内部对象可复制。
-         * shared_ptr 本身可以复制，因此捕获 shared_ptr 的 lambda 可以保存到 std::function 中。
+        /**
+         * std::apply 是 C++ 17 引入的一个非常强大的函数模板，定义在头文件 <tuple> 中。
+         * 它可以将一个可调用对象（如函数、lambda、函数对象等）与一个元组结合，把元组中的所有元素“解包“作为独立的参数传递给可调用对象。
          */
-
-        auto userTask = [callable = FunctionType(std::forward<F>(function)),
+         auto userTask = [callable = FunctionType(std::forward<F>(function)),
                          arguments = ArgumentsTuple(std::forward<Args>(args)...)]() mutable -> ReturnType {
             return std::apply(std::move(callable), std::move(arguments));
         };
@@ -261,8 +240,31 @@ private:
     template <typename ReturnType, typename Callable>
     std::pair<Task, std::future<ReturnType>> MakeTask(Callable&& callable)
     {
+        /*
+         * std::packaged_task 是 C++ 11 引入的一个非常强大的异步任务打包工具。
+         * std::packaged_task<Signature> 是一个模板类，它的模板参数 Signature 是一个函数签名（例如 int(int, double) 或者 void()）。
+         * 它主要做两件事情：
+         *   1. 打包装可调用对象：它可以把任何可调用对象（普通函数、lambda、std::bind、仿函数）打包起来。
+         *   2. 连接 std::future：它内部关联了一个异步状态。当在某个线程中调用这个 packaged_task 时，
+         *      它的执行结果（返回值或者抛出的异常）会自动写入这个异步状态中；而持有对应 std::future 的线程就可以获取这个结果。
+         *
+         * packaged_task 负责：
+         * 1. 执行用户函数；
+         * 2. 保存返回值；
+         * 3. 捕获用户函数抛出的异常；
+         * 4. 将结果或异常写入 future 的共享状态；
+         * 
+         * 这里创建一个无参形式的 packaged_task，签名是 ReturnType()
+         * 由于 packaged_task 不支持拷贝（只能 move），为了能方便地放进 std::function 任务队列，
+         * 通常用 std::make_shared 将其包裹在智能指针中。
+         * 
+         * 将任务包装成 void() 类型的可调用对象，放入任务队列
+         * 
+         * 主要是因为 std::packaged_task 是 move-only 类型。
+         * Day 1 的任务队列保存 std::function<void()>，而 C++17 的 std::function 要求内部对象可复制。
+         * shared_ptr 本身可以复制，因此捕获 shared_ptr 的 lambda 可以保存到 std::function 中。
+         */
         using CallableType = std::decay_t<Callable>;
-
         auto packagedTask = std::make_shared<std::packaged_task<ReturnType()>>(
             [this, userCallable = CallableType(std::forward<Callable>(callable))] () mutable -> ReturnType {
                 try {
