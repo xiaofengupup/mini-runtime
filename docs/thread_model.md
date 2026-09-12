@@ -1,524 +1,216 @@
 # MiniRuntime 线程模型
 
-## 1. 线程角色
+本文说明 MiniRuntime 中的线程角色、锁职责、worker 身份识别和任务执行规则。
 
-MiniRuntime 中存在三类执行线程：
+## 线程角色
 
-```text
-外部提交线程
-工作线程
-CallerRuns 执行线程
-```
+运行时涉及三类执行上下文：
 
----
+- 外部提交线程：不属于当前线程池的调用线程。
+- worker 线程：线程池构造时创建的固定工作线程。
+- CallerRuns 线程：因背压策略或单 worker 内部提交而直接执行任务的提交线程。
 
-## 2. 外部提交线程
+## 外部提交线程
 
-外部提交线程通常是：
-
-* 主线程；
-* 业务请求线程；
-* 测试线程；
-* 其他不属于当前线程池的线程。
-
-外部线程调用：
+外部线程调用 `Submit` 或 `SubmitCancelable` 时，任务进入有界全局队列。提交行为受以下配置影响：
 
 ```cpp
-pool.Submit(task);
+ThreadPoolOptions::queueCapacity
+ThreadPoolOptions::rejectionPolicy
 ```
 
-任务进入全局有界队列。
+外部队列满时：
 
-外部提交受以下配置约束：
+- `Block` 等待空间。
+- `Reject` 抛出 `TaskRejected`。
+- `CallerRuns` 由提交线程直接执行任务。
 
-```text
-queueCapacity
-RejectionPolicy
-```
+## Worker 线程
 
----
-
-## 3. 工作线程
-
-线程池构造时创建固定数量的 Worker：
-
-```cpp
-std::vector<std::thread> workers;
-```
-
-每个 Worker 具有唯一索引：
-
-```text
-0
-1
-2
-...
-threadCount - 1
-```
-
-线程入口：
+`ThreadPool` 构造时按 `threadCount` 创建固定数量 worker。每个 worker 运行：
 
 ```cpp
 WorkerLoop(workerIndex);
 ```
 
-每个 Worker 拥有一个本地任务队列：
+worker 的主循环：
 
 ```text
-localQueues[workerIndex]
+set thread-local identity
+while true:
+  if discardPending: exit
+  try local queue
+  try global queue
+  try steal from other workers
+  if got task:
+    activeTasks++
+    run task outside locks
+    activeTasks--
+    continue
+  wait for task or shutdown
+  if stopping and no pending task: exit
+clear thread-local identity
 ```
 
-Worker 获取任务的顺序为：
+## Worker 身份
+
+当前实现使用 thread-local 变量识别当前线程是否属于某个线程池：
+
+```cpp
+static thread_local ThreadPool* m_currentPool;
+static thread_local std::size_t m_currentWorkerIndex;
+```
+
+worker 启动时设置身份，退出前清除身份。该机制用于：
+
+- 判断提交是否来自当前线程池的 worker。
+- 将 worker 内部提交放入对应本地队列。
+- 在单 worker 场景内联执行子任务，避免自我等待死锁。
+- 禁止任务内部调用所属线程池的关闭接口。
+- 在 CallerRuns 执行期间标记当前线程正在执行本线程池任务。
+
+CallerRuns 执行时，`m_currentPool` 临时设置为当前线程池，`m_currentWorkerIndex` 设置为 `m_kNoWorker`。
+
+## 全局队列
+
+全局队列保存外部提交的等待任务：
+
+```cpp
+std::queue<Task> m_globalTasks;
+```
+
+它由 `m_mutex` 保护，并通过 `queueCapacity` 控制容量。worker 从全局队列取出任务后，会通知一个等待队列空间的 Block 提交线程。
+
+## 本地队列
+
+每个 worker 拥有一个独立本地队列：
+
+```cpp
+std::vector<std::unique_ptr<WorkStealingQueue<Task>>> m_localQueues;
+```
+
+本地队列内部有自己的 mutex。worker 内部提交任务时，如果线程池有多个 worker，任务会进入当前 worker 的本地队列。
+
+本地队列操作：
 
 ```text
-Local queue
-    ↓
-Global queue
-    ↓
-Steal from another local queue
-    ↓
-Condition-variable wait
+owner Push      -> back
+owner TryPop    -> back
+thief TrySteal  -> front
 ```
 
----
+运行时不会在 worker 启动后增删本地队列，因此 `m_localQueues` 中的队列对象地址保持稳定。
 
-## 4. Worker 身份
+## 锁职责
 
-运行时使用：
+`m_mutex` 保护：
 
-```cpp
-static thread_local ThreadPool* currentPool;
-static thread_local std::size_t currentWorkerIndex;
-```
+- `m_globalTasks`
+- `m_state`
+- `m_activeTasks`
 
-识别当前线程是否属于某个线程池。
+`m_mutex` 不保护：
 
-Worker 启动时：
+- 本地队列内部 `deque`
+- `m_pendingTasks`
+- `m_discardPending`
+- 原子指标
 
-```cpp
-currentPool = this;
-currentWorkerIndex = workerIndex;
-```
+`WorkStealingQueue` 内部 mutex 只保护对应本地队列的 `deque`。窃取时一次只访问一个 victim 队列。
 
-Worker 退出前：
+`m_shutdownMutex` 串行化：
 
-```cpp
-currentWorkerIndex = kNoWorker;
-currentPool = nullptr;
-```
+- `Shutdown()`
+- `ShutdownNow()`
+- 析构函数中的 `Shutdown()`
 
-该信息用于：
+worker 不获取 `m_shutdownMutex`。
 
-* 判断提交是否来自 Worker；
-* 将内部提交任务放入正确本地队列；
-* 避免单 Worker 内部提交后等待造成死锁；
-* 禁止任务内部关闭所属线程池；
-* 识别 CallerRuns 上下文。
+## 条件变量
 
----
-
-## 5. CallerRuns 执行线程
-
-当全局队列已满且策略为：
-
-```cpp
-RejectionPolicy::CallerRuns
-```
-
-任务由提交线程直接执行。
-
-CallerRuns 任务：
-
-* 不进入全局队列；
-* 不进入本地队列；
-* 计入 `submitted`；
-* 计入 `callerRuns`；
-* 计入 `activeTasks`；
-* 执行完成后减少 `activeTasks`。
-
-CallerRuns 是一种背压机制，因为提交线程执行任务期间无法继续高速提交。
-
----
-
-## 6. 全局任务队列
-
-全局队列：
-
-```cpp
-std::queue<Task> globalTasks;
-```
-
-用途：
-
-* 保存外部线程提交的任务；
-* 提供有界容量；
-* 实现 Block、Reject 和 CallerRuns。
-
-受运行时主锁保护：
-
-```cpp
-std::mutex mutex;
-```
-
-全局队列容量只限制等待中的外部任务，不包含：
-
-* 正在执行的任务；
-* 本地队列任务；
-* CallerRuns 任务。
-
----
-
-## 7. 本地任务队列
-
-每个 Worker 拥有独立的：
-
-```cpp
-WorkStealingQueue<Task>
-```
-
-本地队列内部有自己的互斥锁：
-
-```cpp
-std::mutex mutex;
-std::deque<Task> queue;
-```
-
-Owner 操作：
+`m_taskAvailableCv` 用于 worker 等待：
 
 ```text
-Push      → back
-TryPop    → back
+pendingTasks > 0
+or state != Running
 ```
 
-Thief 操作：
+`m_queueNotFullCv` 用于 Block 提交者等待：
 
 ```text
-TrySteal  → front
+globalTasks.size() < queueCapacity
+or state != Running
 ```
 
-本地队列不使用运行时主锁保护。
-
-运行时运行期间不会增加、删除或重新分配 `localQueues` 容器中的元素。
-
----
-
-## 8. 锁职责
-
-### 8.1 运行时主锁
-
-```cpp
-std::mutex mutex;
-```
-
-保护：
-
-* `globalTasks`；
-* `state`；
-* `activeTasks`。
-
-它不保护：
-
-* 本地队列内部 deque；
-* `pendingTasks`；
-* `discardPending`；
-* 原子指标。
-
----
-
-### 8.2 本地队列锁
-
-每个 `WorkStealingQueue` 内部拥有一把锁。
-
-只保护该队列的：
-
-```cpp
-std::deque<Task>
-```
-
-Worker 窃取任务时，一次只锁一个本地队列。
-
-不能同时持有多个本地队列锁，否则容易引入锁顺序问题。
-
----
-
-### 8.3 关闭锁
-
-```cpp
-std::mutex shutdownMutex;
-```
-
-用于串行化：
-
-```text
-Shutdown
-ShutdownNow
-析构函数中的 Shutdown
-```
-
-只有一个线程可以执行完整关闭流程和 `join()`。
-
-Worker 不会获取 `shutdownMutex`。
-
----
-
-## 9. 原子变量
-
-### `pendingTasks`
-
-```cpp
-std::atomic<std::size_t> pendingTasks;
-```
-
-表示所有等待队列中的任务总数。
-
-任务进入全局或本地队列时加一。
-
-任务从全局或本地队列取出时减一。
-
-任务被 `ShutdownNow()` 丢弃时减去丢弃数量。
-
----
-
-### `discardPending`
-
-```cpp
-std::atomic<bool> discardPending;
-```
-
-表示是否进入立即关闭模式。
-
-Worker 观察到该标志后停止获取新任务。
-
----
-
-### Metrics
-
-运行指标使用原子计数器。
-
-指标使用 `memory_order_relaxed`，因为只要求计数正确，不承担同步用户数据的职责。
-
----
-
-## 10. 条件变量
-
-### `taskAvailableCv`
-
-等待者：
-
-```text
-Worker
-```
-
-唤醒条件：
-
-```text
-有新任务
-或者
-线程池状态发生变化
-```
-
----
-
-### `queueNotFullCv`
-
-等待者：
-
-```text
-Block 策略下的外部提交线程
-```
-
-唤醒条件：
-
-```text
-全局队列出现空间
-或者
-线程池开始关闭
-```
-
----
-
-### `idleCv`
-
-等待者：
-
-```text
-关闭线程
-```
-
-条件：
+`m_idleCv` 用于关闭线程等待：
 
 ```text
 activeTasks == 0
 ```
 
----
+条件变量等待都必须通过谓词重新检查条件，以处理虚假唤醒。
 
-## 11. Worker 主循环
+## 执行锁规则
 
-```text
-设置 thread_local Worker 身份
-            ↓
-检查 discardPending
-            ↓
-TryPopLocal
-            ↓
-TryPopGlobal
-            ↓
-TrySteal
-            ↓
-找到任务？
-  ├── 是 → activeTasks++ → 执行 → activeTasks--
-  └── 否 → 等待 taskAvailableCv
-            ↓
-检查关闭条件
-            ↓
-退出循环
-            ↓
-清除 thread_local Worker 身份
-```
-
----
-
-## 12. 任务执行锁规则
-
-运行时只在锁内完成：
-
-* 检查状态；
-* 入队；
-* 出队；
-* 更新内部计数；
-* 检查等待条件。
-
-用户任务必须在所有运行时内部锁之外执行：
-
-```cpp
-Task task;
-
-{
-    // Lock.
-    task = PopTask();
-}
-
-// Unlock.
-
-task();
-```
-
-原因：
-
-* 用户任务执行时间不可控；
-* 用户任务可能阻塞；
-* 用户任务可能再次提交任务；
-* 其他 Worker 需要继续获取任务；
-* 提交线程需要继续入队。
-
----
-
-## 13. `join()` 锁规则
-
-严禁在持有运行时主锁时调用：
-
-```cpp
-worker.join();
-```
-
-错误关系：
+用户任务必须在运行时内部锁之外执行。
 
 ```text
-Shutdown thread:
-holds mutex
-waits for worker.join()
-
-Worker:
-waits for mutex
-before exiting
+lock
+  pop task and update counters
+unlock
+run user task
+lock
+  finish task and notify idle waiters
+unlock
 ```
 
-形成死锁。
+这样可以避免用户任务阻塞提交、阻塞其他 worker 取任务，或在递归提交时造成锁重入问题。
 
-正确流程：
+## Join 规则
+
+关闭流程不能在持有 `m_mutex` 时调用 `worker.join()`。
+
+正确顺序：
 
 ```text
-锁内设置 Stopping
-释放主锁
-notify_all
+lock m_mutex
+  set Stopping
+unlock
+notify workers and submitters
 join workers
-重新加锁设置 Stopped
+lock m_mutex
+  wait activeTasks == 0
+  set Stopped
+unlock
 ```
 
----
+如果持锁 join，worker 退出路径可能也需要同一把锁，容易形成死锁。
 
-## 14. 单 Worker 内部提交
+## 单 Worker 内部提交
 
-假设线程池只有一个 Worker：
+单 worker 线程池中，任务内部提交子任务并等待子任务 future 是常见死锁形态：
 
 ```text
-Worker executing parent
-    ↓
+only worker runs parent
 parent submits child
-    ↓
-child enters local queue
-    ↓
+child waits in queue
 parent waits child future
+no worker remains to run child
 ```
 
-唯一 Worker 正在等待，因此没有线程可以执行 child。
+当前实现检测到这种情况时直接在当前线程执行子任务，并计入 `callerRuns`。
 
-为避免该问题，单 Worker 场景下的内部提交直接在当前线程执行。
-
----
-
-## 15. 工作窃取的边界
+## 工作窃取边界
 
 工作窃取可以改善：
 
-* Worker 之间负载不均；
-* 嵌套任务集中在单个本地队列；
-* 部分任务执行时间差异较大。
+- worker 之间负载不均。
+- 子任务集中在某个 worker 本地队列。
+- 部分任务执行时间明显长于其他任务。
 
-工作窃取不能解决：
+它不能解决：
 
-* 循环依赖；
-* 所有 Worker 同时等待未执行子任务；
-* 用户锁顺序错误；
-* 任务之间的逻辑死锁。
-
----
-
-## 16. 线程生命周期
-
-```text
-ThreadPool constructor
-    ↓
-Create all local queues
-    ↓
-Set state to Running
-    ↓
-Start workers
-    ↓
-Run tasks
-    ↓
-Shutdown / ShutdownNow
-    ↓
-Set state to Stopping
-    ↓
-Wake workers
-    ↓
-Workers exit
-    ↓
-Join all workers
-    ↓
-Set state to Stopped
-    ↓
-Destroy ThreadPool members
-```
-
-必须先创建全部本地队列，再启动 Worker。
-
-必须先 `join()` 全部 Worker，再销毁：
-
-* mutex；
-* condition_variable；
-* localQueues；
-* globalTasks；
-* metrics。
+- 用户任务之间的循环等待。
+- 所有 worker 同时等待尚未执行的子任务。
+- 用户代码的锁顺序错误。
+- 阻塞式 I/O 长时间占满 worker。
