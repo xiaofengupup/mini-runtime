@@ -20,13 +20,13 @@
 
 建议：
 
-- 每个场景运行多轮，输出 min、median、p95。
-- 支持 `--csv` 或 `--json` 输出。
-- 分离 submit time、wait/get time、shutdown time。
-- 增加任务粒度参数，例如空任务、轻计算、中计算。
-- 增加多生产者外部提交场景。
-- 在 nested 场景输出 `localSubmitted`、`stolen`、`callerRuns`。
-- 固定线程数序列，例如 `1,2,4,8,hardware_concurrency`。
+- [x] 每个场景运行多轮，输出 min、median、p95。
+- [ ] ~~支持 `--csv` 或 `--json` 输出。~~
+- [x] 分离 submit time、wait/get time、shutdown time。
+- [ ] 增加任务粒度参数，例如空任务、轻计算、中计算。
+- [ ] 增加多生产者外部提交场景。
+- [x] 在 nested 场景输出 `localSubmitted`、`stolen`、`callerRuns`。
+- [x] 固定线程数序列，例如 `1,2,4,8,hardware_concurrency`。
 
 收益：低风险、高确定性。它不会改变运行时行为，但能让后续优化有依据。
 
@@ -150,13 +150,13 @@ ParallelFor(first, last, grainSize, function)
 
 `benchmarks/benchmark_runtime.cpp` 可以先做这些小步修改：
 
-- 修正注释中的 `namspace` 拼写。
-- 命令行支持多轮，例如 `--iterations 10`。
-- 输出 `RuntimeMetricsSnapshot`。
-- 把 `pool.Shutdown()` 的耗时单独记录。
-- 提供多线程 producer 场景。
-- 提供 `CallerRuns` 和 `Reject` 策略场景。
-- 对错误参数打印 usage。
+- [x] 修正注释中的 `namspace` 拼写。
+- [x] 命令行支持多轮，例如 `--iterations 10`。
+- [x] 输出 `RuntimeMetricsSnapshot`。
+- [x] 把 `pool.Shutdown()` 的耗时单独记录。
+- [ ] 提供多线程 producer 场景。
+- [ ] 提供 `CallerRuns` 和 `Reject` 策略场景。
+- [ ] 对错误参数打印 usage。
 
 这些改动不会触碰核心运行时，适合作为第一批优化工作。
 
