@@ -27,7 +27,7 @@ minirt_benchmark <threadCount> <taskCount>
 也可以通过脚本运行：
 
 ```bash
-./scripts/build_and_test.sh release --benchmark --threads 4 --tasks 100000
+./scripts/build_and_test.sh --preset release --benchmark --threads 4 --tasks 100000
 ```
 
 ## 当前场景

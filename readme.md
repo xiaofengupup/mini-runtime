@@ -100,14 +100,14 @@ ctest --preset debug
 运行 sanitizer：
 
 ```bash
-./scripts/build_and_test.sh asan
-./scripts/build_and_test.sh tsan
+./scripts/build_and_test.sh --preset asan
+./scripts/build_and_test.sh --preset tsan
 ```
 
 构建 release 并运行基准测试：
 
 ```bash
-./scripts/build_and_test.sh release --benchmark --threads 4 --tasks 100000
+./scripts/build_and_test.sh --preset release --benchmark --threads 4 --tasks 100000
 ```
 
 ## 基本使用
