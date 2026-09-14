@@ -246,7 +246,7 @@ Release 构建后运行：
 ```bash
 cmake --preset release
 cmake --build --preset release -j
-./build/release/minirt_benchmark 4 100000
+./build/release/minirt_benchmark --threads 4 --tasks 100000 --task-type light --iterations 5 --warmup 1
 ```
 
 当前 benchmark 覆盖两类场景：

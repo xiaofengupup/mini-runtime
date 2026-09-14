@@ -23,7 +23,7 @@
 - [x] 每个场景运行多轮，输出 min、median、p95。
 - [ ] ~~支持 `--csv` 或 `--json` 输出。~~
 - [x] 分离 submit time、wait/get time、shutdown time。
-- [ ] 增加任务粒度参数，例如空任务、轻计算、中计算。
+- [x] 增加任务粒度参数，例如空任务、轻计算、中计算。
 - [ ] 增加多生产者外部提交场景。
 - [x] 在 nested 场景输出 `localSubmitted`、`stolen`、`callerRuns`。
 - [x] 固定线程数序列，例如 `1,2,4,8,hardware_concurrency`。

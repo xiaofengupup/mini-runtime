@@ -15,19 +15,23 @@ benchmarks/benchmark_runtime.cpp
 ```bash
 cmake --preset release
 cmake --build --preset release -j
-./build/release/minirt_benchmark 4 100000
+./build/release/minirt_benchmark --threads 4 --tasks 100000 --task-type light --iterations 5 --warmup 1
 ```
 
-参数含义：
+常用参数：
 
 ```text
-minirt_benchmark <threadCount> <taskCount>
+--threads N       Worker 线程数
+--tasks N         每轮任务数
+--task-type TYPE  任务粒度：empty、light、medium、heavy，也可使用 0、1、2、3
+--iterations N    正式测量轮数
+--warmup N        预热轮数
 ```
 
 也可以通过脚本运行：
 
 ```bash
-./scripts/build_and_test.sh --preset release --benchmark --threads 4 --tasks 100000
+./scripts/build_and_test.sh --preset release --benchmark --threads 4 --tasks 100000 --task-type light --iterations 5 --warmup 1
 ```
 
 ## 当前场景
