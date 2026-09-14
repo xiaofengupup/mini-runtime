@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <atomic>
 
 namespace {
 
@@ -47,9 +48,26 @@ const char* TaskTypeName(TaskType type)
     }
 }
 
+struct TaskRange {
+    std::size_t begin;
+    std::size_t end;
+};
+
+TaskRange RangeForProducer(std::size_t taskCount, std::size_t producerIndex, std::size_t producerCount)
+{
+    const std::size_t base = taskCount / producerCount;
+    const std::size_t remainder = taskCount % producerCount;
+
+    const std::size_t begin = producerIndex * base + std::min(producerIndex, remainder);
+    const std::size_t count = base + (producerIndex < remainder ? 1 : 0);
+
+    return TaskRange {begin, begin + count};
+}
+
 struct BenchmarkOptions {
     std::size_t threadCount {std::max(1U, std::thread::hardware_concurrency())};
     std::size_t taskCount {100000};
+    std::size_t producerCount {2};
     std::size_t iterations {5};
     std::size_t warmup {1};
     TaskType taskType {TaskType::LightCompute};  // 默认任务类型为轻计算
@@ -61,6 +79,7 @@ struct BenchmarkResult {
     std::string name;
     std::size_t threadCount {0};
     std::size_t taskCount {0};
+    std::size_t producerCount {1};
     double submitSeconds {0.0};
     double waitSeconds {0.0};
     double shutdownSeconds {0.0};
@@ -85,6 +104,7 @@ void PrintUsage(const char* program)
         << "Options:\n"
         << "  --threads N       Worker thread count.\n"
         << "  --tasks N         Number of tasks per measured iteration.\n"
+        << "  --producers N     External producer thread count. Default: 2.\n"
         << "  --task-type VALUE Task type: 0/empty, 1/light, 2/medium, 3/heavy. Default: light.\n"
         << "  --iterations N    Number of measured iterations. Default: 5.\n"
         << "  --warmup N        Number of warmup iterations. Default: 1.\n"
@@ -177,7 +197,9 @@ BenchmarkOptions ParseOptions(int argc, char* argv[])
             options.threadCount = ParseSize(RequireValue(index, argc, argv, "--threads"), "threads");
         } else if (argument == "--tasks") {
             options.taskCount = ParseSize(RequireValue(index, argc, argv, "--tasks"), "tasks");
-        } else if (argument == "--task-type") {
+        } else if (argument == "--producers") {
+            options.producerCount = ParseSize(RequireValue(index, argc, argv, "--producers"), "producers");
+        }  else if (argument == "--task-type") {
             options.taskType = ParseTaskType(RequireValue(index, argc, argv, "--task-type"));
         } else if (argument == "--iterations") {
             options.iterations = ParseSize(RequireValue(index, argc, argv, "--iterations"), "iterations");
@@ -187,6 +209,8 @@ BenchmarkOptions ParseOptions(int argc, char* argv[])
             options.threadCount = ParseSize(argument.substr(10), "threads");
         } else if (argument.rfind("--tasks=", 0) == 0) {
             options.taskCount = ParseSize(argument.substr(8), "tasks");
+        } else if (argument.rfind("--producers=", 0) == 0) {
+            options.producerCount = ParseSize(argument.substr(12), "producers");
         } else if (argument.rfind("--task-type=", 0) == 0) {
             options.taskType = ParseTaskType(argument.substr(12));
         } else if (argument.rfind("--iterations=", 0) == 0) {
@@ -200,8 +224,8 @@ BenchmarkOptions ParseOptions(int argc, char* argv[])
         }
     }
 
-    if (options.threadCount == 0 || options.taskCount == 0 || options.iterations == 0) {
-        throw std::invalid_argument("threadCount, taskCount and iterations must be greater than zero");
+    if (options.threadCount == 0 || options.taskCount == 0 || options.iterations == 0 || options.producerCount == 0) {
+        throw std::invalid_argument("threadCount, taskCount, producers and iterations must be greater than zero");
     }
 
     return options;
@@ -301,6 +325,7 @@ void PrintTextSummary(const std::vector<BenchmarkResult>& results)
         << std::left << std::setw(24) << last.name << "\n"
         << "threads=" << last.threadCount
         << ", tasks=" << last.taskCount
+        << ", producers=" << last.producerCount
         << ", total_ms[min/median/p95]="
         << FormatMilliseconds(total.min) << '/'
         << FormatMilliseconds(total.median) << '/'
@@ -415,6 +440,7 @@ BenchmarkResult RunExternalSubmission(std::size_t threadCount, std::size_t taskC
         ScenarioName("external submission", taskType),
         threadCount,
         taskCount,
+        1,
         std::chrono::duration<double>(submitDone - start).count(),
         std::chrono::duration<double>(waitDone - submitDone).count(),
         std::chrono::duration<double>(shutdownDone - waitDone).count(),
@@ -479,12 +505,102 @@ BenchmarkResult RunNestedSubmission(std::size_t threadCount, std::size_t taskCou
         ScenarioName("nested work stealing", taskType),
         threadCount,
         taskCount,
+        1,
         std::chrono::duration<double>(submitDone - start).count(),
         std::chrono::duration<double>(waitDone - submitDone).count(),
         std::chrono::duration<double>(shutdownDone - waitDone).count(),
         std::chrono::duration<double>(shutdownDone - start).count(),
         childSubmitSeconds,
         childWaitSeconds,
+        checksum,
+        pool.GetMetrics()
+    };
+}
+
+BenchmarkResult RunMultiProducerExternalSubmission(
+    std::size_t threadCount, std::size_t taskCount, TaskType taskType, std::size_t producerCount)
+{
+
+    minirt::ThreadPoolOptions options;
+    options.threadCount = threadCount;
+    options.queueCapacity = 4096;
+    options.rejectionPolicy = minirt::RejectionPolicy::Block;
+
+    minirt::ThreadPool pool(options);
+
+    std::vector<std::vector<std::future<std::uint64_t>>> futuresByProducer(producerCount);
+    std::vector<std::thread> producerThreads;
+    std::vector<std::exception_ptr> errors(producerCount);
+
+    producerThreads.reserve(producerCount);
+
+    std::promise<void> startPromise;
+    std::shared_future<void> startSignal = startPromise.get_future().share();
+    std::atomic<std::size_t> readyCount {0};
+
+    for (std::size_t producerIndex = 0; producerIndex < producerCount; ++producerIndex) {
+        producerThreads.emplace_back([&, producerIndex] {
+            readyCount.fetch_add(1, std::memory_order_release);
+            startSignal.wait();
+
+            try {
+                const TaskRange range = RangeForProducer(taskCount, producerIndex, producerCount);
+                auto& futures = futuresByProducer[producerIndex];
+                futures.reserve(range.end - range.begin);
+
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    futures.push_back(pool.Submit([taskType, index] {
+                        return RunSyntheticWork(taskType, index);
+                    }));
+                }
+            } catch (...) {
+                errors[producerIndex] = std::current_exception();
+            }
+        });
+    }
+
+    while (readyCount.load(std::memory_order_acquire) < producerCount) {
+        std::this_thread::yield();
+    }
+
+    const auto start = Clock::now();
+    startPromise.set_value();
+
+    for (auto& producerThread : producerThreads) {
+        producerThread.join();
+    }
+
+    const auto submitDone = Clock::now();
+
+    for (const auto& error : errors) {
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+
+    std::uint64_t checksum = 0;
+    for (auto& futures : futuresByProducer) {
+        for (auto& future : futures) {
+            checksum += future.get();
+        }
+    }
+
+    const auto waitDone = Clock::now();
+
+    pool.Shutdown();
+    const auto shutdownDone = Clock::now();
+
+    return BenchmarkResult {
+        ScenarioName("multi producer external", taskType),
+        threadCount,
+        taskCount,
+        producerCount,
+        std::chrono::duration<double>(submitDone - start).count(),
+        std::chrono::duration<double>(waitDone - submitDone).count(),
+        std::chrono::duration<double>(shutdownDone - waitDone).count(),
+        std::chrono::duration<double>(shutdownDone - start).count(),
+        0.0,
+        0.0,
         checksum,
         pool.GetMetrics()
     };
@@ -527,29 +643,34 @@ int main(int argc, char* argv[])
         std::cout << "[MiniRuntime benchmark] Please run in Release mode for meaningful results.\n"
                   << "[Options] threads=" << options.threadCount
                   << " tasks=" << options.taskCount
+                  << " producers=" << options.producerCount
                   << " task-type=" << TaskTypeName(options.taskType)
                   << " iterations=" << options.iterations
                   << " warmup=" << options.warmup
                   << "\n\n";
 
+        // 单生产者外部提交
         const auto externalResults = RunIterations(
             RunExternalSubmission,
-            options.threadCount,
-            options.taskCount,
-            options.taskType,
-            options.warmup,
-            options.iterations);
+            options.threadCount, options.taskCount, options.taskType, options.warmup, options.iterations);
 
+        // 单生产者嵌套提交
         const auto nestedResults = RunIterations(
             RunNestedSubmission,
-            options.threadCount,
-            options.taskCount,
-            options.taskType,
-            options.warmup,
-            options.iterations);
+            options.threadCount, options.taskCount, options.taskType, options.warmup, options.iterations);
+
+        // 多生产者外部提交
+        const auto multiProducersResults = RunIterations(
+            [producerCount = options.producerCount](std::size_t threadCount, std::size_t taskCount, TaskType taskType) {
+                return RunMultiProducerExternalSubmission(threadCount, taskCount, taskType, producerCount);
+            },
+            options.threadCount, options.taskCount, options.taskType,
+            options.warmup, options.iterations
+        );
 
         PrintTextSummary(externalResults);
         PrintTextSummary(nestedResults);
+        PrintTextSummary(multiProducersResults);
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << "benchmark failed: " << exception.what() << '\n';

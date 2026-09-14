@@ -12,6 +12,7 @@ Options:
   --benchmark         Run minirt_benchmark after building.
   --threads N         Thread count passed to benchmark. Default: benchmark binary default.
   --tasks N           Task count passed to benchmark. Default: benchmark binary default.
+  --producers N       External producer thread count. Default: benchmark binary default.
   --task-type VALUE   Task type: 0/empty, 1/light, 2/medium, 3/heavy. Default: benchmark binary default.
   --iterations N      Measured benchmark iterations. Default: benchmark binary default.
   --warmup N          Benchmark warmup iterations. Default: benchmark binary default.
@@ -41,6 +42,7 @@ run_tests=1
 run_benchmark=0
 benchmark_threads=""
 benchmark_tasks=""
+benchmark_producers=""
 benchmark_task_type=""
 benchmark_iterations=""
 benchmark_warmup=""
@@ -81,6 +83,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --task-type=*)
             benchmark_task_type="${1#--task-type=}"
+            shift
+            ;;
+        --producers)
+            benchmark_producers="$(require_value "$@")"
+            shift 2
+            ;;
+        --producers=*)
+            benchmark_producers="${1#--producers=}"
             shift
             ;;
         --iterations)
@@ -169,6 +179,9 @@ if [[ "$run_benchmark" -eq 1 ]]; then
     fi
     if [[ -n "${benchmark_task_type}" ]]; then
         args+=("--task-type" "$benchmark_task_type")
+    fi
+    if [[ -n "$benchmark_producers" ]]; then
+        args+=("--producers" "$benchmark_producers")
     fi
     if [[ -n "$benchmark_iterations" ]]; then
         args+=("--iterations" "$benchmark_iterations")
