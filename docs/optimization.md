@@ -55,10 +55,10 @@ using Task = std::function<void()>;
 
 可选优化：
 
-- 分片全局队列，按提交线程 hash 或 round-robin 分发。
-- 外部提交也按 worker round-robin 投递到本地队列，但需要重新设计容量限制。
-- 使用 MPMC 有界队列替换 `std::queue + mutex`。
-- 将状态锁和全局队列锁拆开，减少无关临界区竞争。
+- [ ] 分片全局队列，按提交线程 hash 或 round-robin 分发。
+- [ ] 外部提交也按 worker round-robin 投递到本地队列，但需要重新设计容量限制。
+- [ ] 使用 MPMC 有界队列替换 `std::queue + mutex`。
+- [x] 将状态锁和全局队列锁拆开，减少无关临界区竞争。
 
 风险：中到高。容量、Block 唤醒、`ShutdownNow()` 清理和 `pendingTasks` 计数都会受影响。
 

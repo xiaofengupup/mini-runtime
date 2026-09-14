@@ -10,6 +10,7 @@
 #include "minirt/thread_pool_options.h"
 #include "minirt/work_stealing_queue.h"
 
+#include <atomic>
 #include <vector>
 #include <thread>
 #include <functional>
@@ -361,16 +362,19 @@ private:
     void WorkerLoop(std::size_t workerIndex);
 
     /**
-     * 当前正在运行的任务数量减一
+     * 维护当前正在运行的任务数量
      */
+    void BeginTaskExecution() noexcept;
+
     void FinishTaskExecution() noexcept;
 
 private:
-    RuntimeState m_state { RuntimeState::Created };
+    std::atomic<RuntimeState> m_state { RuntimeState::Created };
     
     std::vector<std::thread> m_workers;
     
     // 外部线程提交的有界全局队列
+    mutable std::mutex m_globalTasksMutex;
     std::queue<Task> m_globalTasks; 
 
     // 每个工作线程拥有一个本地双端队列
@@ -387,8 +391,8 @@ private:
     // ShutdownNow 开始后，工作线程停止从队列获取新任务。
     std::atomic<bool> m_discardPending {false};
 
-    /* 保护 m_tasks、m_state、m_activeTasks */
-    mutable std::mutex m_mutex;
+    /* 保护 m_activeTasks */
+    mutable std::mutex m_activeMutex;
 
     /* 串行化多个并发的 Shutdown 调用 */
     std::mutex m_shutdownMutex;

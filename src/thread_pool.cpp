@@ -36,7 +36,7 @@ ThreadPool::ThreadPool(ThreadPoolOptions options) : m_options(options)
      * 
      * 工作线程一旦启动，就可能理解进入 WorkerLoop，因此不能等待所有线程创建完毕才修改状态。
      */
-    m_state = RuntimeState::Running;
+    m_state.store(RuntimeState::Running, std::memory_order_release);
 
     try {
         for (std::size_t i = 0; i < m_options.threadCount; ++i) {
@@ -51,8 +51,8 @@ ThreadPool::ThreadPool(ThreadPoolOptions options) : m_options(options)
          * 此时，必须停止并回收已经创建好的线程
          */
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_state = RuntimeState::Stopping;
+            std::lock_guard<std::mutex> lock(m_globalTasksMutex);
+            m_state.store(RuntimeState::Stopping, std::memory_order_release);
             m_discardPending.store(true, std::memory_order_release);
         }
 
@@ -65,11 +65,7 @@ ThreadPool::ThreadPool(ThreadPoolOptions options) : m_options(options)
             }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_state = RuntimeState::Stopped;
-        }
-
+        m_state.store(RuntimeState::Stopped, std::memory_order_release);
         throw;
     }
 }
@@ -89,7 +85,7 @@ void ThreadPool::Dispatch(Task task)
     bool notifyWorker = false;
     const bool isWorkerThread = (m_currentPool == this && m_currentWorkerIndex != m_kNoWorker);
     {
-        std::unique_lock<std::mutex> lock(m_mutex);
+        std::unique_lock<std::mutex> lock(m_globalTasksMutex);
         /**
          * 只有 Running 状态可以接收新任务
          * 
@@ -97,7 +93,7 @@ void ThreadPool::Dispatch(Task task)
          * 1. 如果 Submit 先获得锁，任务进入任务队列并被执行；
          * 2. 如果 Shutdown 先获得锁，Submit 被拒绝；
          */
-        if (m_state != RuntimeState::Running) {
+        if (m_state.load(std::memory_order_acquire) != RuntimeState::Running) {
             m_metrics.OnRejected();
             throw TaskRejected("Cannot submit task: ThreadPool is not running");
         }
@@ -111,7 +107,7 @@ void ThreadPool::Dispatch(Task task)
              */
             if (m_options.threadCount == 1) {
                 runInCaller = true;
-                ++m_activeTasks;
+                BeginTaskExecution();
 
                 m_metrics.OnSubmitted();
                 m_metrics.OnCallerRuns();
@@ -136,10 +132,11 @@ void ThreadPool::Dispatch(Task task)
                         runInCaller = true;
                     } else {
                         m_queueNotFullCv.wait(lock, [this] {
-                            return m_state != RuntimeState::Running || m_globalTasks.size() < m_options.queueCapacity;
+                            return m_state.load(std::memory_order_acquire) != RuntimeState::Running ||
+                                   m_globalTasks.size() < m_options.queueCapacity;
                         });
 
-                        if (m_state != RuntimeState::Running) {
+                        if (m_state.load(std::memory_order_acquire) != RuntimeState::Running) {
                             m_metrics.OnRejected();
                             throw TaskRejected("ThreadPool stopped while submitter was waiting for queue space");
                         }
@@ -168,7 +165,7 @@ void ThreadPool::Dispatch(Task task)
 
             if (runInCaller) {
                 // CallerRuns 任务虽然不在工作线程中运行，仍然属于线程池已经接受的任务。
-                ++m_activeTasks;
+                BeginTaskExecution();
                 m_metrics.OnSubmitted();
                 m_metrics.OnCallerRuns();
             } else {
@@ -231,8 +228,8 @@ void ThreadPool::DispatchOnly(Task task)
     bool notifyWorker = false;
     const bool isWorkerThread = (m_currentPool == this && m_currentWorkerIndex != m_kNoWorker);
     {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (m_state != RuntimeState::Running) {
+        std::unique_lock<std::mutex> lock(m_globalTasksMutex);
+        if (m_state.load(std::memory_order_acquire) != RuntimeState::Running) {
             m_metrics.OnRejected();
             throw TaskRejected("Cannot submit task: ThreadPool is not running");
         }
@@ -277,7 +274,7 @@ bool ThreadPool::TryPopLocal(std::size_t workerIndex, Task& task)
 bool ThreadPool::TryPopGlobal(Task& task)
 {
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> lock(m_globalTasksMutex);
         if (m_globalTasks.empty()) {
             return false;
         }
@@ -339,8 +336,7 @@ void ThreadPool::ShutdownNow()
 
 RuntimeState ThreadPool::GetState() const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_state;
+    return m_state.load(std::memory_order_acquire);
 }
 
 std::size_t ThreadPool::PendingTaskCount() const noexcept
@@ -364,32 +360,25 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
         throw std::logic_error("Shutdown cannot be called from a task running in this ThreadPool");
     }
 
-    /*
-     * 防止多个线程同时执行 join。
-     *
-     * 第二个 Shutdown 调用会在这里等待第一个调用完成，随后发现状态已经是 Stopped，直接返回。
-     */
     std::lock_guard<std::mutex> shutdownLock(m_shutdownMutex);
 
-    /**
+    /*
      * shutdown 丢弃的任务暂存在局部队列中
      * 
-     * 先在 m_mutex 保护下与 m_globalTasks 进行交换，再在锁外销毁，避免在持有任务队列锁时执行大量析构操作
+     * 先在 m_globalTasksMutex 保护下与 m_globalTasks 进行交换，再在锁外销毁，避免在持有任务队列锁时执行大量析构操作
      */
     std::vector<Task> discardedTasks;
+    std::queue<Task> discardedGlobalTasks;
     {
-        std::lock_guard<std::mutex> taskLock(m_mutex);
-
-        if (m_state == RuntimeState::Stopped) {
+        std::lock_guard<std::mutex> taskLock(m_globalTasksMutex);
+        if (m_state.load(std::memory_order_acquire) == RuntimeState::Stopped) {
             return;
         }
-        m_state = RuntimeState::Stopping;
+        m_state.store(RuntimeState::Stopping, std::memory_order_release);
         
         if (mode == ShutdownMode::DiscardPending) {
-            while (!m_globalTasks.empty()) {
-                discardedTasks.emplace_back(std::move(m_globalTasks.front()));
-                m_globalTasks.pop();
-            }
+            m_discardPending.store(true, std::memory_order_release);
+            m_globalTasks.swap(discardedGlobalTasks);
         }
     }
 
@@ -399,6 +388,11 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
          *
          * 工作线程也会在下一轮检查 m_discardPending 后停止取新任务。
          */
+        discardedTasks.reserve(discardedGlobalTasks.size());
+        while (!discardedGlobalTasks.empty()) {
+            discardedTasks.emplace_back(std::move(discardedGlobalTasks.front()));
+            discardedGlobalTasks.pop();
+        }
         for (const auto& localQueue : m_localQueues) {
             localQueue->DrainTo(discardedTasks);
         }
@@ -432,12 +426,12 @@ void ThreadPool::ShutdownImpl(ShutdownMode mode)
     }
 
     {
-        std::unique_lock<std::mutex> lock(m_mutex);
+        std::unique_lock<std::mutex> lock(m_activeMutex);
         m_idleCv.wait(lock, [this] {
             return m_activeTasks == 0;
         });
-        m_state = RuntimeState::Stopped;
     }
+    m_state.store(RuntimeState::Stopped, std::memory_order_release);
 }
 
 void ThreadPool::WorkerLoop(std::size_t workerIndex)
@@ -459,10 +453,7 @@ void ThreadPool::WorkerLoop(std::size_t workerIndex)
 
         Task task;
         if (TryGetTask(workerIndex, task)) {
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                ++m_activeTasks;
-            }
+            BeginTaskExecution();
 
             try {
                 task();
@@ -475,25 +466,18 @@ void ThreadPool::WorkerLoop(std::size_t workerIndex)
             continue;
         }
 
-        /**
-         * 这里使用 unique_lock 是因为 condition_variable::wait() 在等待过程中需要：
-         * 1. 自动释放 m_mutex
-         * 2. 进入休眠
-         * 3. 被唤醒后重新获取 mutex
-         * 4. 返回调用代码
-         * 
-         * std::lock_guard 不支持中途主动结果和重新加锁，因此条件变量通常搭配 st::unique_lock。
-         */
-        std::unique_lock<std::mutex> lock(m_mutex);
         /*
+         * condition_variable::wait() 需要在等待过程中释放并重新获取锁，因此这里必须使用 unique_lock
          * 条件变量可能发生虚假唤醒，所以线程唤醒不代表一定存在任务，因此每次醒来都必须重新检查条件
          */
+        std::unique_lock<std::mutex> lock(m_globalTasksMutex);
         m_taskAvailableCv.wait(lock, [this] {
-            return m_state != RuntimeState::Running || m_pendingTasks.load(std::memory_order_acquire) > 0;
+            return m_state.load(std::memory_order_acquire) != RuntimeState::Running ||
+                   m_pendingTasks.load(std::memory_order_acquire) > 0;
         });
 
         const bool shouldExit = 
-            (m_state != RuntimeState::Running) &&
+            (m_state.load(std::memory_order_acquire) != RuntimeState::Running) &&
             (m_discardPending.load(std::memory_order_acquire) || m_pendingTasks.load(std::memory_order_acquire) == 0);
         if (shouldExit) {
             break;
@@ -504,9 +488,15 @@ void ThreadPool::WorkerLoop(std::size_t workerIndex)
     m_currentPool = nullptr;
 }
 
+void ThreadPool::BeginTaskExecution() noexcept
+{
+    std::lock_guard<std::mutex> lock(m_activeMutex);
+    ++m_activeTasks;
+}
+
 void ThreadPool::FinishTaskExecution() noexcept
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_activeMutex);
 
     if (m_activeTasks > 0) {
         m_activeTasks--;
