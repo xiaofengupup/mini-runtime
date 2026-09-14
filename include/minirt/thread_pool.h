@@ -5,6 +5,7 @@
 
 #include "minirt/cancellation.h"
 #include "minirt/runtime_metrics.h"
+#include "minirt/task.h"
 #include "minirt/task_handle.h"
 #include "minirt/thread_pool_options.h"
 #include "minirt/work_stealing_queue.h"
@@ -35,7 +36,7 @@ enum class RuntimeState {
 
 class ThreadPool {
 public:
-    using Task = std::function<void()>;
+    using Task = MoveOnlyTask;
 
     /**
      * 创建固定数量工作线程的线程池
@@ -235,7 +236,7 @@ private:
      * - packaged_task；
      * - future；
      * - 成功、失败和取消指标；
-     * - std::function<void()> 类型擦除。
+     * - move-only task 类型擦除。
      */
     template <typename ReturnType, typename Callable>
     std::pair<Task, std::future<ReturnType>> MakeTask(Callable&& callable)
@@ -254,18 +255,12 @@ private:
          * 3. 捕获用户函数抛出的异常；
          * 4. 将结果或异常写入 future 的共享状态；
          * 
-         * 这里创建一个无参形式的 packaged_task，签名是 ReturnType()
-         * 由于 packaged_task 不支持拷贝（只能 move），为了能方便地放进 std::function 任务队列，
-         * 通常用 std::make_shared 将其包裹在智能指针中。
-         * 
-         * 将任务包装成 void() 类型的可调用对象，放入任务队列
-         * 
-         * 主要是因为 std::packaged_task 是 move-only 类型。
-         * Day 1 的任务队列保存 std::function<void()>，而 C++17 的 std::function 要求内部对象可复制。
-         * shared_ptr 本身可以复制，因此捕获 shared_ptr 的 lambda 可以保存到 std::function 中。
+         * 这里创建一个无参形式的 packaged_task，签名是 ReturnType()。
+         * 队列保存 MoveOnlyTask，因此可以直接 move 捕获 packaged_task，
+         * 不再需要 shared_ptr 间接持有。
          */
         using CallableType = std::decay_t<Callable>;
-        auto packagedTask = std::make_shared<std::packaged_task<ReturnType()>>(
+        std::packaged_task<ReturnType()> packagedTask(
             [this, userCallable = CallableType(std::forward<Callable>(callable))] () mutable -> ReturnType {
                 try {
                     if constexpr (std::is_void_v<ReturnType>) {
@@ -289,10 +284,10 @@ private:
             }
         );
 
-        std::future<ReturnType> future = packagedTask->get_future();
-        Task task = [packagedTask] {
-            (*packagedTask)();
-        };
+        std::future<ReturnType> future = packagedTask.get_future();
+        Task task([packagedTask = std::move(packagedTask)]() mutable {
+            packagedTask();
+        });
 
         return std::make_pair(std::move(task), std::move(future));
     }
