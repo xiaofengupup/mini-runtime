@@ -140,7 +140,7 @@ public:
          * std::apply 是 C++ 17 引入的一个非常强大的函数模板，定义在头文件 <tuple> 中。
          * 它可以将一个可调用对象（如函数、lambda、函数对象等）与一个元组结合，把元组中的所有元素“解包“作为独立的参数传递给可调用对象。
          */
-         auto userTask = [callable = FunctionType(std::forward<F>(function)),
+        auto userTask = [callable = FunctionType(std::forward<F>(function)),
                          arguments = ArgumentsTuple(std::forward<Args>(args)...)]() mutable -> ReturnType {
             return std::apply(std::move(callable), std::move(arguments));
         };
@@ -187,6 +187,28 @@ public:
         Dispatch(std::move(taskAndFuture.first));
 
         return TaskHandle<ReturnType>(std::move(taskAndFuture.second), std::move(cancellationState));
+    }
+
+    /**
+     * 支持提交 无返回值 fire-and-forget 任务，核心特点：
+     *  - 不等待：调用线程不会等待任务执行结果。
+     *  - 非阻塞提交：队列满时直接拒绝，不执行 Block 或 CallerRuns 策略。
+     *  - 无返回值：操作不返回任何有用的数据给调用方。
+     *  - 状态未知：任务被接受后，调用方无法直接获知任务是成功、失败还是仍在运行。
+     */
+    template <typename F, typename... Args>
+    void Post(F&& function, Args&&... args)
+    {
+        using FunctionType = std::decay_t<F>;
+        using ArgumentsTuple = std::tuple<std::decay_t<Args>...>;
+
+        auto userTask = [
+            callable = FunctionType(std::forward<F>(function)),
+            arguments = ArgumentsTuple(std::forward<Args>(args)...)]() mutable {
+                std::apply(std::move(callable), std::move(arguments));
+        };
+
+        DispatchOnly(MakeTaskOnly(std::move(userTask)));
     }
 
     /**
@@ -296,6 +318,29 @@ private:
      * 根据队列状态和拒绝策略分发任务。
      */
     void Dispatch(Task task);
+
+    template <typename Callable>
+    Task MakeTaskOnly(Callable&& callable)
+    {
+        using CallableType = std::decay_t<Callable>;
+        auto wrappedTask = [this, userCallable = CallableType(std::forward<Callable>(callable))] () mutable {
+            try {
+                std::invoke(std::move(userCallable));
+                m_metrics.OnCompleted();
+            } catch (const TaskCancelled&) {
+                m_metrics.OnCancelled();
+            } catch (...) {
+                m_metrics.OnFailed();
+            }
+        };
+
+        return Task(std::move(wrappedTask));
+    }
+
+    /**
+     * 分发 无返回值 fire-and-forget 任务
+     */
+    void DispatchOnly(Task task);
 
     bool TryGetTask(std::size_t workerIndex, Task& task);
 

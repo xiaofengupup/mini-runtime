@@ -213,6 +213,57 @@ void ThreadPool::Dispatch(Task task)
     }
 }
 
+void ThreadPool::DispatchOnly(Task task)
+{
+    if (task == nullptr) {
+        throw std::invalid_argument("ThreadPool cannot dispatch an empty task");
+    }
+
+    /**
+     * fire-and-forget 任务特点：
+     *  - 不等待：调用线程不会等待任务执行结果。
+     *  - 非阻塞提交：队列满时直接拒绝，不执行 Block 或 CallerRuns 策略。
+     *  - 无返回值：操作不返回任何有用的数据给调用方。
+     *  - 状态未知：任务被接受后，调用方无法直接获知任务是成功、失败还是仍在运行。
+     * 
+     * 因此，该任务不会直接在调用线程运行；全局队列已满时直接拒绝。
+     */
+    bool notifyWorker = false;
+    const bool isWorkerThread = (m_currentPool == this && m_currentWorkerIndex != m_kNoWorker);
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_state != RuntimeState::Running) {
+            m_metrics.OnRejected();
+            throw TaskRejected("Cannot submit task: ThreadPool is not running");
+        }
+
+        if (isWorkerThread) {
+            // 工作线程提交直接进入本地队列
+            m_localQueues[m_currentWorkerIndex]->Push(std::move(task));
+            m_pendingTasks.fetch_add(1, std::memory_order_release);
+
+            m_metrics.OnSubmitted();
+            m_metrics.OnLocalSubmitted();
+            notifyWorker = true;
+        } else {
+            // 外部线程提交，全部进入全局队列；队列已满时保持非阻塞语义，直接拒绝。
+            if (m_globalTasks.size() >= m_options.queueCapacity) {
+                m_metrics.OnRejected();
+                throw TaskRejected("Cannot submit fire-and-foget task: task queue is full");
+            }
+
+            m_globalTasks.push(std::move(task));
+            m_pendingTasks.fetch_add(1, std::memory_order_release);
+            m_metrics.OnSubmitted();
+            notifyWorker = true;
+        }
+    }
+
+    if (notifyWorker) {
+        m_taskAvailableCv.notify_one();
+    }
+}
+
 bool ThreadPool::TryPopLocal(std::size_t workerIndex, Task& task)
 {
     if (!m_localQueues[workerIndex]->TryPop(task)) {

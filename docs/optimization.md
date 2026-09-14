@@ -44,7 +44,7 @@ using Task = std::function<void()>;
 
 - [ ] ~~C++23 可改用 `std::move_only_function<void()>`。~~
 - [x] C++17 可自定义 move-only task wrapper。
-- [ ] 对无返回值 fire-and-forget 任务提供专门接口，避免 future 共享状态。
+- [x] 对无返回值 fire-and-forget 任务提供专门接口，避免 future 共享状态。
 - [ ] ~~引入任务对象池，复用包装节点。~~
 
 风险：中等。需要完整验证异常传播、取消、`ShutdownNow()` 丢弃任务后的 broken promise 行为。

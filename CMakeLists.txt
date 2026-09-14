@@ -94,6 +94,7 @@ if(BUILD_TESTING)
     add_executable(minirt_tests
         tests/test_thread_pool.cpp
         tests/test_task.cpp
+        tests/test_post.cpp
         tests/test_submit.cpp
         tests/test_backpressure.cpp
         tests/test_cancellation.cpp
